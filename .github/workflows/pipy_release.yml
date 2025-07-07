@@ -121,7 +121,7 @@ jobs:
      # 3. Build the PyPI packeage
     - name: Build a binary wheel
       run: >-
-        python setup.py sdist bdist_wheel
+        python3 -m build
     - name: Store the distribution packages
       uses: actions/upload-artifact@v4
       with:
