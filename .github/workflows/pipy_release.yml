@@ -78,7 +78,7 @@ jobs:
     - name: Install pypa/setuptools
       run: |
         git config --global url."https://${{secrets.REPO_TOKEN}}@github.com".insteadOf "https://github.com"
-        python -m pip install build setuptools wheel
+        pip install build setuptools wheel
 
     # update the version number in version.py
     - name: update version
