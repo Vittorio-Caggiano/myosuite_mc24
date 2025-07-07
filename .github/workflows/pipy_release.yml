@@ -110,12 +110,12 @@ jobs:
     - uses: mukunku/tag-exists-action@v1.4.0
       id: checkTag
       with:
-        tag: v${{ needs.get_next_version.outputs.new_tag }}
+        tag: ${{ needs.get_next_version.outputs.new_tag }}
 
     - name: If Tag does not exists, Create Git Tag
       run: |
-        git tag v${{ needs.get_next_version.outputs.new_tag }}
-        git push origin v${{ needs.get_next_version.outputs.new_tag }}
+        git tag ${{ needs.get_next_version.outputs.new_tag }}
+        git push origin ${{ needs.get_next_version.outputs.new_tag }}
 
 
      # 3. Build the PyPI packeage
