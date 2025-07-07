@@ -39,7 +39,7 @@ jobs:
 
     steps:
       - name: checkout-repo-content
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: setup-python
         uses: actions/setup-python@v2
@@ -48,6 +48,7 @@ jobs:
       - name: get next version and tag
         id: get-next-version-and-tag
         run: |
+          git config --global url."https://${{secrets.REPO_TOKEN}}@github.com".insteadOf "https://github.com"
           output=$(python3 .github/release_utils.py --release-type ${{ github.event.inputs.name }})
           echo $output
           new_version=$(echo $output | awk '{print $1}')
@@ -93,7 +94,7 @@ jobs:
     - name: add and commit to main
       uses: EndBug/add-and-commit@v9
       with:
-        token: ${{ secrets.REPO_TOKEN }}
+        # token: ${{ secrets.REPO_TOKEN }}
         # author_name: ${{ secrets.AUTHOR_NAME }}
         # author_email: ${{ secrets.AUTHOR_EMAIL }}
         # branch: main
