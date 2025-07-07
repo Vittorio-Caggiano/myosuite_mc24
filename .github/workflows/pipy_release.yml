@@ -96,7 +96,7 @@ jobs:
         # token: ${{ secrets.REPO_TOKEN }}
         author_name: ${{ secrets.AUTHOR_NAME }}
         author_email: ${{ secrets.AUTHOR_EMAIL }}
-        branch: main
+        # branch: main
         default_author: github_actor
         message: '${{ needs.get_next_version.outputs.new_version }} release'
         pathspec_error_handling: exitAtEnd
