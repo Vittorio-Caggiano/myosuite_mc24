@@ -48,7 +48,6 @@ jobs:
       - name: get next version and tag
         id: get-next-version-and-tag
         run: |
-          git config --global url."https://${{secrets.REPO_TOKEN}}@github.com".insteadOf "https://github.com"
           output=$(python3 .github/release_utils.py --release-type ${{ github.event.inputs.name }})
           echo $output
           new_version=$(echo $output | awk '{print $1}')
@@ -78,6 +77,7 @@ jobs:
 
     - name: Install pypa/setuptools
       run: >-
+        git config --global url."https://${{secrets.REPO_TOKEN}}@github.com".insteadOf "https://github.com"
         python -m
         pip install wheel
 
@@ -91,27 +91,43 @@ jobs:
 
     # 2. Use the `tag name` as `release version`
     # add and commit the updated version.py to main
-    - name: add and commit to main
-      uses: EndBug/add-and-commit@v9
-      with:
-        # token: ${{ secrets.REPO_TOKEN }}
-        # author_name: ${{ secrets.AUTHOR_NAME }}
-        # author_email: ${{ secrets.AUTHOR_EMAIL }}
-        # branch: main
-        default_author: github_actor
-        message: '${{ needs.get_next_version.outputs.new_version }} release'
-        pathspec_error_handling: exitAtEnd
+    # - name: add and commit to main
+    #   uses: EndBug/add-and-commit@v7.5.0
+    #   with:
+    #     # token: ${{ secrets.REPO_TOKEN }}
+    #     author_name: ${{ secrets.AUTHOR_NAME }}
+    #     author_email: ${{ secrets.AUTHOR_EMAIL }}
 
-        # Arguments for the git pull command. Use NO-PULL to avoid the action pulling at all.
-        # Default: '--no-rebase'
-        pull: 'NO-PULL'
-        tag: '${{ needs.get_next_version.outputs.new_tag }}'
+    #     branch: main
+    #     default_author: github_actor
+    #     message: '${{ needs.get_next_version.outputs.new_version }} release'
+    #     pathspec_error_handling: exitAtEnd
+
+    #     # Arguments for the git pull command. Use NO-PULL to avoid the action pulling at all.
+    #     # Default: '--no-rebase'
+    #     pull: 'NO-PULL'
+    #     tag: '${{ needs.get_next_version.outputs.new_tag }}'
+
+    - uses: mukunku/tag-exists-action@v1.4.0
+      id: checkTag
+      with:
+        tag: v${{ needs.get_next_version.outputs.new_tag }}
+
+    - name: If Tag does not exists, Create Git Tag
+      run: |
+        git tag v${{ needs.get_next_version.outputs.new_tag }}
+        git push origin v${{ needs.get_next_version.outputs.new_tag }}
 
 
      # 3. Build the PyPI packeage
     - name: Build a binary wheel
       run: >-
         python setup.py sdist bdist_wheel
+    - name: Store the distribution packages
+      uses: actions/upload-artifact@v4
+      with:
+        name: python-package-distributions
+        path: dist/
     # 4. Upload the package
     - name: Publish distribution to PyPI
       uses: pypa/gh-action-pypi-publish@master
