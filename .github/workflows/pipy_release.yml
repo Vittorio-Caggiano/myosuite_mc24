@@ -91,7 +91,7 @@ jobs:
     # 2. Use the `tag name` as `release version`
     # add and commit the updated version.py to main
     - name: add and commit to main
-      uses: EndBug/add-and-commit@v7.5.0
+      uses: EndBug/add-and-commit@v9
       with:
         # token: ${{ secrets.REPO_TOKEN }}
         author_name: ${{ secrets.AUTHOR_NAME }}
