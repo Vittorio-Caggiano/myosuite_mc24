@@ -44,11 +44,15 @@ def update_version(new_version_tuple) -> None:
         current_version_data = reader.read()
 
     # for line in current_version_data:
-    version_match = re.search(r"^__version_tuple__ ", current_version_data)
+    version_match = re.search(
+        r"^__version_tuple__ ", current_version_data, re.MULTILINE
+    )
 
     if version_match:
         new_version_data = "__version_tuple__ = %s\n" % str(new_version_tuple)
-        current_version_data = current_version_data.replace(version_match.string, new_version_data)
+        current_version_data = current_version_data.replace(
+            version_match.group(), new_version_data
+        )
 
         with open("myosuite/version.py", "w") as writer:
             writer.write(current_version_data)
