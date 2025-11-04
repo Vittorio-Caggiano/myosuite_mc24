@@ -324,6 +324,7 @@ class SoccerEnvV0(WalkEnvV0):
                                             [self.GOAL_X_POS, self.GOAL_Y_MAX, self.GOAL_Z_MAX]]).flatten()
         obs_dict['model_root_pos'] = self.sim.data.joint('root').qpos.copy()
         obs_dict['model_root_vel'] = self.sim.data.joint('root').qvel.copy()
+        obs_dict['goalkeeper_pos'] = self.goalkeeper.get_goalkeeper_pose()[0:2].copy()
 
         return obs_dict
 
