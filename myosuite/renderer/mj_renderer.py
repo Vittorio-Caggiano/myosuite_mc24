@@ -104,7 +104,7 @@ class MJRenderer(Renderer):
         if camera_id == None:
             camera_id = -1
         if self._renderer is None:
-            self.setup_renderer(self._mj_model.ptr, width=width, height=height)
+            self.setup_renderer(self._mj_model, width=width, height=height)
 
         rgb_arr = None
         dpt_arr = None
