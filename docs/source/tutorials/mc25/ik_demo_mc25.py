@@ -128,8 +128,8 @@ diff_env = TableTennisEnvV0(
 
 env.reset()
 
-model = env.sim.model._model
-data = env.sim.data._data
+model = env.mj_model._model
+data = env.mj_data._data
 
 ## =================== ##
 ## Setup IK.

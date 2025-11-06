@@ -328,7 +328,7 @@ def examine_logs(
                 # log: offscreen frames
                 if render == "offscreen":
                     for cam in camera_name:
-                        curr_frame = env.sim.renderer.render_offscreen(
+                        curr_frame = env.mj_renderer.render_offscreen(
                             camera_id=cam,
                             width=frame_size[0],
                             height=frame_size[1],
