@@ -41,14 +41,32 @@ It is recommended to use [Miniconda](https://docs.conda.io/en/latest/miniconda.h
 ``` bash
 conda create --name myosuite python=3.9
 conda activate myosuite
-```
-
-### Using pip
-It is possible to install MyoSuite with:
-``` bash
 pip install -U myosuite
 ```
-for advanced installation, see [here](https://myosuite.readthedocs.io/en/latest/install.html#alternative-installing-from-source).
+
+### Using uv (recommended)
+For faster installation, you can use [uv](https://github.com/astral-sh/uv), a fast Python package installer:
+
+``` bash
+# Install uv (if not already installed)
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# Create and activate a virtual environment
+uv venv
+source .venv/bin/activate  # On Windows: .venv\Scripts\activate
+
+# Install MyoSuite
+uv pip install -U myosuite
+```
+
+For installation from source with uv:
+``` bash
+git clone --recursive https://github.com/myohub/myosuite.git
+cd myosuite
+uv pip install -e .
+```
+
+For advanced installation options, see [here](https://myosuite.readthedocs.io/en/latest/install.html#alternative-installing-from-source).
 
 Test your installation using the following command (this will return also a list of all the current environments):
 ``` bash

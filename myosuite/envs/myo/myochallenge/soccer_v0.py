@@ -405,6 +405,7 @@ class SoccerEnvV0(WalkEnvV0):
             obs_dict["act"] = self.mj_data.act[:].copy()
 
         # exteroception
+
         obs_dict["ball_pos"] = self.mj_data.body("soccer_ball").xpos[:3].copy()
         obs_dict["goal_bounds"] = np.array(
             [
@@ -416,6 +417,9 @@ class SoccerEnvV0(WalkEnvV0):
         ).flatten()
         obs_dict["model_root_pos"] = self.mj_data.joint("root").qpos.copy()
         obs_dict["model_root_vel"] = self.mj_data.joint("root").qvel.copy()
+
+        obs_dict['goalkeeper_pos'] = self.goalkeeper.get_goalkeeper_pose()[0:2].copy()
+
 
         return obs_dict
 

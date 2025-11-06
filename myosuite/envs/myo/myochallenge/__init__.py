@@ -52,7 +52,7 @@ register_env_with_variants(id='myoChallengeSoccerP2-v0',
             'normalize_act': True,
             'min_agent_spawn_distance': 1,
             'reset_type': 'random', # none, init, random
-            'goalkeeper_probabilities': (0, 0, 1),
+            'goalkeeper_probabilities': (0.1, 0.3, 0.6),
             'max_time_sec': 10,
         }
     )
