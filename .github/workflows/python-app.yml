@@ -81,13 +81,10 @@ jobs:
 
     - name: Run Test mjx
       run: |
-        conda activate $CONDA_DEFAULT_ENV
-        uv run pip install -e '.[mjx]'
-        uv run pip install pytest
-        uv run python -m pytest myosuite/tests/test_mjx.py -v
-        uv run python -m pytest myosuite/tests/mjx/test_quat_math.py -v
-        uv run python -m pytest myosuite/tests/mjx/test_fatigue.py -v
-        uv run python -m pytest myosuite/tests/mjx/test_reference_motion.py -v
+        uv run --with ".[mjx]" python -m pytest myosuite/tests/test_mjx.py -v
+        uv run --with ".[mjx]" python -m pytest myosuite/tests/mjx/test_quat_math.py -v
+        uv run --with ".[mjx]" python -m pytest myosuite/tests/mjx/test_fatigue.py -v
+        uv run --with ".[mjx]" python -m pytest myosuite/tests/mjx/test_reference_motion.py -v
 
     - name: Run Test environment
       run: uv run python -m myosuite.tests.test_myo
