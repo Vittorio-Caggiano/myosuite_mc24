@@ -30,26 +30,60 @@ Below is an overview of the tasks in the MyoSuite.
 ## Installations
 You will need Python 3.9 or later versions.
 
+### Using uv
+[uv](https://docs.astral.sh/uv/) is a fast Python package manager. Install MyoSuite with:
+``` bash
+uv sync -p 3.9
+```
+
+### Using conda
 It is recommended to use [Miniconda](https://docs.conda.io/en/latest/miniconda.html#latest-miniconda-installer-links) and to create a separate environment with:
 ``` bash
 conda create --name myosuite python=3.9
 conda activate myosuite
-```
-
-It is possible to install MyoSuite with:
-``` bash
 pip install -U myosuite
 ```
-for advanced installation, see [here](https://myosuite.readthedocs.io/en/latest/install.html#alternative-installing-from-source).
+
+### Using uv (recommended)
+For faster installation, you can use [uv](https://github.com/astral-sh/uv), a fast Python package installer:
+
+``` bash
+# Install uv (if not already installed)
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# Create and activate a virtual environment
+uv venv
+source .venv/bin/activate  # On Windows: .venv\Scripts\activate
+
+# Install MyoSuite
+uv pip install -U myosuite
+```
+
+For installation from source with uv:
+``` bash
+git clone --recursive https://github.com/myohub/myosuite.git
+cd myosuite
+uv pip install -e .
+```
+
+For advanced installation options, see [here](https://myosuite.readthedocs.io/en/latest/install.html#alternative-installing-from-source).
 
 Test your installation using the following command (this will return also a list of all the current environments):
 ``` bash
+# With uv:
+uv run python -m myosuite.tests.test_myo
+
+# With pip/conda:
 python -m myosuite.tests.test_myo
 ```
 
 
 You can also visualize the environments with random controls using the command below:
 ``` bash
+# With uv:
+uv run python -m myosuite.utils.examine_env --env_name myoElbowPose1D6MRandom-v0
+
+# With pip/conda:
 python -m myosuite.utils.examine_env --env_name myoElbowPose1D6MRandom-v0
 ```
 **NOTE:** On MacOS, we moved to mujoco native `launch_passive` which requires that the Python script be run under `mjpython`:
@@ -57,8 +91,12 @@ python -m myosuite.utils.examine_env --env_name myoElbowPose1D6MRandom-v0
 mjpython -m myosuite.utils.examine_env --env_name myoElbowPose1D6MRandom-v0
 ```
 
-It is possible to take advantage of the latest MyoSkeleton. Once added (follow the instructions prompted by `python -m myosuite_init`), run:
+It is possible to take advantage of the latest MyoSkeleton. Once added (follow the instructions prompted by `uv run myoapi_init` or `python -m myosuite_init`), run:
 ``` bash
+# With uv:
+uv run python -m myosuite.utils.examine_sim -s myosuite/simhive/myo_model/myoskeleton/myoskeleton.xml
+
+# With pip/conda:
 python -m myosuite.utils.examine_sim -s myosuite/simhive/myo_model/myoskeleton/myoskeleton.xml
 ```
 

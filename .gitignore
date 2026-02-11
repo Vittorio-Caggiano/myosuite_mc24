@@ -124,3 +124,8 @@ osl.log
 /workspace
 
 *processed.xml
+
+logs/
+
+# Pycharm generated files
+.idea/
