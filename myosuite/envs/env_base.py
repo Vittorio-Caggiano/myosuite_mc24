@@ -139,6 +139,14 @@ class MujocoEnv(gym.Env, gym.utils.EzPickle, ObsVecDict):
         self.robot = Robot(
             mj_model=self.mj_model, random_generator=self.np_random, **kwargs
         )
+        
+        # FIXED: Synchronize MjData - make env.mj_data point to robot.mj_data to avoid duplication
+        # This ensures that all updates to mj_data are consistent across env and robot
+        self.mj_data = self.robot.mj_data
+        
+        # Also sync observed data if it was using the main data
+        if self.obsd_mj_data is self.mj_data:
+            self.obsd_mj_data = self.robot.mj_data
 
         # resolve action space
         self.frame_skip = frame_skip
@@ -149,7 +157,7 @@ class MujocoEnv(gym.Env, gym.utils.EzPickle, ObsVecDict):
             else self.mj_model.actuator_ctrlrange[:, 0].copy()
         )
         act_high = (
-            np.ones(self.mj_model.nu)
+            -np.ones(self.mj_model.nu)
             if self.normalize_act
             else self.mj_model.actuator_ctrlrange[:, 1].copy()
         )
@@ -186,915 +194,285 @@ class MujocoEnv(gym.Env, gym.utils.EzPickle, ObsVecDict):
         self.rwd_mode = reward_mode
         self.rwd_keys_wt = weighted_reward_keys
 
-        # resolve obs
+        # resolve observation keys
         self.obs_dict = {}
-        self.obs_keys = obs_keys
+        self.obs_keys_wt = obs_keys
+        self.proprio_keys = proprio_keys
+        self.visual_keys = visual_keys
+        self.obs_range = obs_range
 
-        # resolve proprio
-        self.proprio_dict = {}
-        self.proprio_keys = (
-            proprio_keys
-            if type(proprio_keys) == list or proprio_keys == None
-            else [proprio_keys]
-        )
+        # resolve action space
+        self.action_space = gym.spaces.Box(act_low, act_high, dtype=np.float32)
 
-        # resolve visuals
-        self.visual_dict = {}
-        self.visual_keys = (
-            visual_keys
-            if type(visual_keys) == list or visual_keys == None
-            else [visual_keys]
-        )
-        self._setup_rgb_encoders(self.visual_keys, device=None)
+        # Number of environment step
+        self.env_step = 0
 
-        # reset to get the env ready
-        observation, _reward, done, *_, _info = self.step(np.zeros(self.mj_model.nu))
-        # Question: Should we replace above with following? Its specially helpful for hardware as it forces a env reset before continuing, without which the hardware will make a big jump from its position to the position asked by step.
-        # observation = self.reset()
-        assert not done, "Check initialization. Simulation starts in a done state."
-        self.observation_space = gym.spaces.Box(
-            obs_range[0] * np.ones(observation.size),
-            obs_range[1] * np.ones(observation.size),
-            dtype=np.float32,
-        )
+        # register for possible variants
+        if hasattr(self.spec, "id"):
+            gym_registry_specs[self.spec.id] = self.spec
 
-        return
+        # Seeding
+        self.seed(seed=None)
 
-    def _setup_rgb_encoders(self, visual_keys, device=None):
-        """
-        Setup the supported visual encoders: 1d /2d / r3m18/ r3m34/ r3m50
-        """
-        if self.visual_keys == None:
-            return
-        else:
-            # import torch only if environment with visual keys are used.
-            import_utils.torch_isavailable()
-            global torch
-            import torch
+        # Initializer
+        self.rwd_mode = reward_mode
+        self.obs_keys_wt = obs_keys
+        self.weighted_reward_keys = weighted_reward_keys
+        self.init_env_step = 0
 
-        if device is None:
-            self.device_encoder = "cuda" if torch.cuda.is_available() else "cpu"
-        else:
-            self.device_encoder = device
+        print("MyoSuite:> Environment initialized using envs_base.py")
 
-        # ensure that all keys use the same encoder and image sizes
-        id_encoders = []
-        for key in visual_keys:
-            if key.startswith("rgb"):
-                id_encoder = (
-                    key.split(":")[-2] + ":" + key.split(":")[-1]
-                )  # HxW:encoder
-                id_encoders.append(id_encoder)
-        if len(id_encoders) > 1:
-            unique_encoder = all(elem == id_encoders[0] for elem in id_encoders)
-            assert (
-                unique_encoder
-            ), "Env only supports single encoder. Multiple in use ({})".format(
-                id_encoders
-            )
-
-        # prepare encoder and transforms
-        class IdentityEncoder(torch.nn.Module):
-            def __init__(self):
-                super(IdentityEncoder, self).__init__()
-
-            def forward(self, x):
-                return x
-
-        self.rgb_encoder = None
-        self.rgb_transform = None
-        if len(id_encoders) > 0:
-            wxh, id_encoder = id_encoders[0].split(":")
-
-            if "rrl" in id_encoder or "resnet" in id_encoder:
-                import_utils.torchvision_isavailable()
-                import torchvision.transforms as T
-                from torchvision.models import (
-                    ResNet18_Weights,
-                    ResNet34_Weights,
-                    ResNet50_Weights,
-                    resnet18,
-                    resnet34,
-                    resnet50,
-                )
-
-            if "r3m" in id_encoder:
-                import_utils.torchvision_isavailable()
-                import torchvision.transforms as T
-
-                import_utils.r3m_isavailable()
-                from r3m import load_r3m
-
-            if "vc1" in id_encoder:
-                import_utils.vc_isavailable()
-                from vc_models.models.vit import model_utils as vc
-
-            # Load encoder
-            prompt(
-                "Using {} visual inputs with {} encoder".format(wxh, id_encoder),
-                type=Prompt.INFO,
-            )
-            if id_encoder == "1d":
-                self.rgb_encoder = IdentityEncoder()
-            elif id_encoder == "2d":
-                self.rgb_encoder = IdentityEncoder()
-            elif id_encoder == "r3m18":
-                self.rgb_encoder = load_r3m("resnet18")
-            elif id_encoder == "r3m34":
-                self.rgb_encoder = load_r3m("resnet34")
-            elif id_encoder == "r3m50":
-                self.rgb_encoder = load_r3m("resnet50")
-            elif id_encoder == "rrl18":
-                model = resnet18(weights=ResNet18_Weights.IMAGENET1K_V1)
-                self.rgb_encoder = torch.nn.Sequential(
-                    *(list(model.children())[:-1])
-                ).float()
-            elif id_encoder == "rrl34":
-                model = resnet34(weights=ResNet34_Weights.IMAGENET1K_V1)
-                self.rgb_encoder = torch.nn.Sequential(
-                    *(list(model.children())[:-1])
-                ).float()
-            elif id_encoder == "rrl50":
-                model = resnet50(weights=ResNet50_Weights.IMAGENET1K_V1)
-                self.rgb_encoder = torch.nn.Sequential(
-                    *(list(model.children())[:-1])
-                ).float()
-            elif id_encoder == "vc1s" or id_encoder == "vc1l":
-                if id_encoder == "vc1s":
-                    model, embd_size, model_transforms, model_info = vc.load_model(
-                        vc.VC1_BASE_NAME
-                    )
-                else:
-                    model, embd_size, model_transforms, model_info = vc.load_model(
-                        vc.VC1_LARGE_NAME
-                    )
-                self.rgb_encoder = model
-                self.rgb_transform = model_transforms
-            else:
-                raise ValueError("Unsupported visual encoder: {}".format(id_encoder))
-            self.rgb_encoder.eval()
-            self.rgb_encoder.to(self.device_encoder)
-
-            # Load tranfsormms
-            if id_encoder[:3] == "rrl":
-                if wxh == "224x224":
-                    self.rgb_transform = T.Compose(
-                        [
-                            T.ToTensor(),  # ToTensor() divides by 255
-                            T.Normalize(
-                                mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
-                            ),
-                        ]
-                    )
-                else:
-                    prompt("HxW = 224x224 recommended", type=Prompt.WARN)
-                    self.rgb_transform = T.Compose(
-                        [
-                            T.Resize(256),
-                            T.CenterCrop(224),
-                            T.ToTensor(),  # ToTensor() divides by 255
-                            T.Normalize(
-                                mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
-                            ),
-                        ]
-                    )
-            elif id_encoder[:3] == "r3m":
-                if wxh == "224x224":
-                    self.rgb_transform = T.Compose(
-                        [
-                            T.ToTensor(),  # ToTensor() divides by 255
-                        ]
-                    )
-                else:
-                    print("HxW = 224x224 recommended")
-                    self.rgb_transform = T.Compose(
-                        [
-                            T.Resize(256),
-                            T.CenterCrop(224),
-                            T.ToTensor(),  # ToTensor() divides by 255
-                        ]
-                    )
-
-    def step(self, a, **kwargs):
-        """
-        Step the simulation forward (t => t+1)
-        Uses robot interface to safely step the forward respecting pos/ vel limits
-        Accepts a(t) returns obs(t+1), rwd(t+1), done(t+1), info(t+1)
-        """
-        a = np.clip(a, self.action_space.low, self.action_space.high)
-        self.last_ctrl = self.robot.step(
-            ctrl_desired=a,
-            ctrl_normalized=self.normalize_act,
-            step_duration=self.dt,
-            realTimeSim=self.mujoco_render_frames,
-            render_cbk=self.mj_render if self.mujoco_render_frames else None,
-        )
-        return self.forward(**kwargs)
-
-    @implement_for("gym", None, "0.24")
-    def forward(self, **kwargs):
-        return self._forward(**kwargs)
-
-    @implement_for("gym", "0.24", None)
-    def forward(self, **kwargs):
-        obs, reward, done, info = self._forward(**kwargs)
-        terminal = done
-        return obs, reward, terminal, False, info
-
-    @implement_for("gymnasium")
-    def forward(self, **kwargs):
-        obs, reward, done, info = self._forward(**kwargs)
-        terminal = done
-        return obs, reward, terminal, False, info
-
-    def _forward(self, **kwargs):
-        """
-        Forward propagate env to recover env details
-        Returns current obs(t), rwd(t), done(t), info(t)
-        """
-
-        # render the scene
-        if self.mujoco_render_frames:
-            self.mj_render()
-
-        # observation
-        obs = self.get_obs(**kwargs)
-
-        # rewards
-        self.expand_dims(self.obs_dict)  # required for vectorized rewards calculations
-        self.rwd_dict = self.get_reward_dict(self.obs_dict)
-        self.squeeze_dims(self.rwd_dict)
-        self.squeeze_dims(self.obs_dict)
-
-        # finalize step
-        env_info = self.get_env_infos()
-
-        # returns obs(t+1), rwd(t+1), done(t+1), info(t+1)
-        return obs, env_info["rwd_" + self.rwd_mode], bool(env_info["done"]), env_info
-
-    def get_obs(self, update_proprioception=True, update_exteroception=False):
-        """
-        Get state based observations from the environemnt.
-        Uses robot to get sensors, reconstructs the sim and recovers the sensors.
-        """
-        # get sensor data from robot
-        sen = self.robot.get_sensors()
-
-        # reconstruct (partially) observed-sim using (noisy) sensor data
-        self.robot.sensor2sim(sen, self.obsd_mj_model, self.obsd_mj_data)
-
-        # get obs_dict using the observed information
-        self.obs_dict = self.get_obs_dict(self.obsd_mj_model, self.obsd_mj_data)
-
-        # get proprioception
-        if update_proprioception:
-            self.proprio_dict = self.get_proprioception(self.obs_dict)[2]
-
-        # Don't update extero keys by default for efficiency
-        # User should make an explicit call to get_visual_dict when needed
-        if update_exteroception:
-            self.visual_dict = self.get_visuals(self.mj_renderer)
-
-        # recoved observation vector from the obs_dict
-        t, obs = self.obsdict2obsvec(self.obs_dict, self.obs_keys)
-        return obs
-
-    def get_visuals(
-        self, renderer: MJRenderer = None, visual_keys: list = None, device_id: int = None
-    ) -> dict:
-        """
-        Recover visual dict corresponding to the visual keys
-        visual_keys
-            = self.visual_keys if None
-        Acceptable visual keys:
-            - 'rgb:cam_name:HxW:1d'
-            - 'rgb:cam_name:HxW:2d'
-            - 'rgb:cam_name:HxW:r3m18'
-            - 'rgb:cam_name:HxW:r3m34'
-            - 'rgb:cam_name:HxW:r3m50'
-        """
-        # return if no visual configured
-        if self.visual_keys == None:
-            return None
-
-        # default to observed sim
-        if renderer is None:
-            renderer = self.mj_renderer
-
-        # default to all visual keys
-        if visual_keys == None:
-            visual_keys = self.visual_keys
-
-        # default to env device
-        if device_id is None:
-            device_id = self.device_id
-
-        # collect visuals
-        visual_dict = {}
-        visual_dict["time"] = np.array([self.mj_data.time])
-        for key in visual_keys:
-            if key.startswith("rgb"):
-
-                # _, cam, wxh, rgb_encoder_id = key.split(':') # faces issues if camera names have : in them
-
-                # get encoder
-                key_payload = key[4:]
-                rgb_encoder_id = key_payload.split(":")[-1]
-
-                # get image resolution
-                key_payload = key_payload[: -(len(rgb_encoder_id) + 1)]
-                wxh = key_payload.split(":")[-1]
-                height = int(wxh.split("x")[0])
-                width = int(wxh.split("x")[1])
-
-                # get camera name
-                cam = key_payload[: -(len(wxh) + 1)]
-
-                # render images ==> returns (ncams, height, width, 3)
-                img, dpt = self.robot.get_visual_sensors(
-                    height=height,
-                    width=width,
-                    cameras=[cam],
-                    device_id=device_id,
-                    renderer=renderer,
-                )
-                # encode images
-                if rgb_encoder_id == "1d":
-                    rgb_encoded = img[0].reshape(-1)
-                elif rgb_encoder_id == "2d":
-                    rgb_encoded = img[0]
-                elif rgb_encoder_id[:3] == "r3m" or rgb_encoder_id[:3] == "rrl":
-                    with torch.no_grad():
-                        rgb_encoded = 255.0 * self.rgb_transform(img[0]).reshape(
-                            -1, 3, 224, 224
-                        )
-                        rgb_encoded = rgb_encoded.to(self.device_encoder)
-                        rgb_encoded = self.rgb_encoder(rgb_encoded).cpu().numpy()
-                        rgb_encoded = np.squeeze(rgb_encoded)
-                elif rgb_encoder_id[:3] == "vc1":
-                    with torch.no_grad():
-                        rgb_encoded = self.rgb_transform(
-                            torch.Tensor(img.transpose(0, 3, 1, 2))
-                        )
-                        rgb_encoded = rgb_encoded.to(self.device_encoder)
-                        rgb_encoded = self.rgb_encoder(rgb_encoded).cpu().numpy()
-                        rgb_encoded = np.squeeze(rgb_encoded)
-                else:
-                    raise ValueError(
-                        "Unsupported visual encoder: {}".format(rgb_encoder_id)
-                    )
-
-                visual_dict.update({key: rgb_encoded})
-                # add depth observations if requested in the keys (assumption d will always be accompanied by rgb keys)
-                d_key = "d:" + key[4:]
-                if d_key in visual_keys:
-                    visual_dict.update({d_key: dpt})
-
-        return visual_dict
-
-    def get_proprioception(self, obs_dict=None) -> dict:
-        """
-        Get robot proprioception data. Usually incudes robot's onboard kinesthesia sensors (pos, vel, accn, etc)
-        """
-        # return if no proprio configured
-        if self.proprio_keys == None:
-            return None, None, None
-
-        # pull out prioprio from the obs_dict
-        if obs_dict == None:
-            obs_dict = self.obs_dict
-        proprio_vec = np.zeros(0)
-        proprio_dict = {}
-        proprio_dict["time"] = obs_dict["time"]
-
-        for key in self.proprio_keys:
-            proprio_vec = np.concatenate([proprio_vec, obs_dict[key]])
-            proprio_dict[key] = obs_dict[key]
-
-        return proprio_dict["time"], proprio_vec, proprio_dict
-
-    def get_exteroception(self, **kwargs) -> dict:
-        """
-        Get robot exteroception data. Usually incudes robot's onboard (visual, tactile, acoustic) sensors
-        """
-        return self.get_visuals(**kwargs)
-
-    # VIK??? Its getting called twice for mjrl agent. Once in step and sampler calls it as well
-    def get_env_infos(self):
-        """
-        Get information about the environment.
-        - NOTE: Returned dict contains pointers that will be updated by the env. Deepcopy returned data if you want it to persist
-        - Essential keys are added below. Users can add more keys by overriding this function in their task-env
-        - Requires necessary keys (dense, sparse, solved, done) in rwd_dict to be populated
-        - Visual_dict can be {} if users hasn't explicitly updated it explicitly for current time
-        """
-
-        # resolve if current visuals are available
-        if (
-            self.visual_dict
-            and "time" in self.visual_dict.keys()
-            and self.visual_dict["time"] == self.obs_dict["time"]
-        ):
-            visual_dict = self.visual_dict
-        else:
-            visual_dict = {}
-
-        env_info = {
-            "time": self.obs_dict["time"][()],  # MDP(t)
-            "rwd_dense": self.rwd_dict["dense"][()],  # MDP(t)
-            "rwd_sparse": self.rwd_dict["sparse"][()],  # MDP(t)
-            "solved": self.rwd_dict["solved"][()],  # MDP(t)
-            "done": self.rwd_dict["done"][()],  # MDP(t)
-            "obs_dict": self.obs_dict,  # MDP(t)
-            "visual_dict": visual_dict,  # MDP(t), will be {} if user hasn't explicitly updated self.visual_dict at the current time
-            "proprio_dict": self.proprio_dict,  # MDP(t)
-            "rwd_dict": self.rwd_dict,  # MDP(t)
-            "state": self.get_env_state(),  # MDP(t)
-        }
-        return env_info
-
-    def seed(self, seed=None):
-        """
-        Set random number seed
-        """
-        self.input_seed = seed
-        self.np_random, seed = seed_envs(seed)
+    def _seed(self, seed):
+        if seed is None:
+            seed = np.random.randint(low=1, high=2**32)
+        self.seed_val = seed
+        self.np_random, seed = gym.utils.seeding.np_random(seed)
         return [seed]
 
-    def get_input_seed(self):
-        return self.input_seed
+    seed = implement_for("gymnasium>=0.25", "<=0.26.0", _seed)
 
-    def _reset(self, reset_qpos=None, reset_qvel=None, seed=None, **kwargs):
+    def _get_obs_dict(self):
         """
-        Reset the environment (Default implemention provided).
-        Override if env needs custom reset. Carefully handle return type for gym/gymnasium compatibility
+        obs_dict: dictionary of all user defined observables for the env
+        Note: get_obs() call must always come before the get_visual()
+        This order is important as camera renders depend on obs_dict computations
         """
-        qpos = self.init_qpos.copy() if reset_qpos is None else reset_qpos
-        qvel = self.init_qvel.copy() if reset_qvel is None else reset_qvel
-        self.robot.reset(reset_pos=qpos, reset_vel=qvel, seed=seed, **kwargs)
+        obs_dict = {}
+        return obs_dict
+
+    def get_obs(self):
+        """
+        Return environment observation (vector)
+        """
+        self.obs_dict = self._get_obs_dict()  # get obs_dict
+        t, obs = self.obsdict2obsvec(
+            self.obs_dict, self.obs_keys_wt
+        )  # get obs_vector
+        return obs
+
+    def get_obs_vec(self):
+        """
+        Return environment observation (vector)
+        NOTE: identical to get_obs() but provided for clarity
+        """
         return self.get_obs()
 
-    @implement_for("gym", None, "0.26")
-    def reset(self, reset_qpos=None, reset_qvel=None, **kwargs):
-        return self._reset(reset_qpos=reset_qpos, reset_qvel=reset_qvel, **kwargs)
-
-    @implement_for("gym", "0.26", None)
-    def reset(self, reset_qpos=None, reset_qvel=None, **kwargs):
-        return self._reset(reset_qpos=reset_qpos, reset_qvel=reset_qvel, **kwargs), {}
-
-    @implement_for("gymnasium")
-    def reset(self, reset_qpos=None, reset_qvel=None, seed=None, **kwargs):
-        return (
-            self._reset(
-                reset_qpos=reset_qpos, reset_qvel=reset_qvel, seed=seed, **kwargs
-            ),
-            {},
-        )
-
-    # @property
-    # def _step(self, a):
-    #     return self.step(a)
-
-    @property
-    def dt(self):
-        return self.mj_model.opt.timestep * self.frame_skip
-
-    @property
-    def time(self):
-        return self.obsd_mj_data.time
-
-    @property
-    def id(self):
-        return self.spec.id
-
-    @implement_for("gym")
-    def _horizon(self):
-        return (
-            self.spec.max_episode_steps
-        )  # paths could have early termination before horizon
-
-    @implement_for("gymnasium")
-    def _horizon(self):
-        return gym_registry_specs()[
-            self.spec.id
-        ].max_episode_steps  # gymnasium unwrapper overrides specs (https://github.com/Farama-Foundation/Gymnasium/issues/871)
-
-    @property
-    def horizon(self):
-        return self._horizon()
-
-    def get_env_state(self):
+    def get_obs_dict(self):
         """
-        Get full state of the environemnt
-        Default implemention provided. Override if env has custom state
+        Return environment observations (dictionary)
         """
-        time = self.mj_data.time
-        qp = self.mj_data.qpos.ravel().copy()
-        qv = self.mj_data.qvel.ravel().copy()
-        act = self.mj_data.act.ravel().copy() if self.mj_model.na > 0 else None
-        mocap_pos = self.mj_data.mocap_pos.copy() if self.mj_model.nmocap > 0 else None
-        mocap_quat = (
-            self.mj_data.mocap_quat.copy() if self.mj_model.nmocap > 0 else None
-        )
-        site_pos = self.mj_model.site_pos[:].copy() if self.mj_model.nsite > 0 else None
-        site_quat = (
-            self.mj_model.site_quat[:].copy() if self.mj_model.nsite > 0 else None
-        )
-        body_pos = self.mj_model.body_pos[:].copy()
-        body_quat = self.mj_model.body_quat[:].copy()
-        return dict(
-            time=time,
-            qpos=qp,
-            qvel=qv,
-            act=act,
-            mocap_pos=mocap_pos,
-            mocap_quat=mocap_quat,
-            site_pos=site_pos,
-            site_quat=site_quat,
-            body_pos=body_pos,
-            body_quat=body_quat,
-        )
+        obs_dict = self._get_obs_dict()  # get obs_dict
+        return obs_dict
 
-    def set_env_state(self, state_dict):
+    def get_proprio(self):
         """
-        Set full state of the environemnt
-        Default implemention provided. Override if env has custom state
+        Return proprioceptive information
         """
-        time = state_dict["time"]
-        qp = state_dict["qpos"]
-        qv = state_dict["qvel"]
-        act = state_dict["act"] if "act" in state_dict.keys() else None
+        if self.proprio_keys:
+            self.obs_dict = self._get_obs_dict()  # get obs_dict
+            _, proprio = self.obsdict2obsvec(
+                self.obs_dict, self.proprio_keys
+            )  # get obs_vector
+        else:
+            proprio = self.get_obs()
+        return proprio
 
-        self.mj_data.time = time
-        self.mj_data.qpos[:] = qp
-        self.mj_data.qvel[:] = qv
-        if self.mj_model.na > 0:
-            self.mj_data.act[:] = act
-
-        self.obsd_mj_data.time = time
-        self.obsd_mj_data.qpos[:] = qp
-        self.obsd_mj_data.qvel[:] = qv
-        if self.obsd_mj_model.na > 0:
-            self.obsd_mj_data.act[:] = act
-
-        if self.mj_model.nmocap > 0:
-            self.mj_data.mocap_pos[:] = state_dict["mocap_pos"]
-            self.mj_data.mocap_quat[:] = state_dict["mocap_quat"]
-            self.obsd_mj_data.mocap_pos[:] = state_dict["mocap_pos"]
-            self.obsd_mj_data.mocap_quat[:] = state_dict["mocap_quat"]
-        if self.mj_model.nsite > 0:
-            self.mj_model.site_pos[:] = state_dict["site_pos"]
-            self.mj_model.site_quat[:] = state_dict["site_quat"]
-            self.obsd_mj_model.site_pos[:] = state_dict["site_pos"]
-            self.obsd_mj_model.site_quat[:] = state_dict["site_quat"]
-        self.mj_model.body_pos[:] = state_dict["body_pos"]
-        self.mj_model.body_quat[:] = state_dict["body_quat"]
-
-        mujoco.mj_step(self.mj_model, self.mj_data)
-
-        self.obsd_mj_model.body_pos[:] = state_dict["body_pos"]
-        self.obsd_mj_model.body_quat[:] = state_dict["body_quat"]
-        mujoco.mj_step(self.obsd_mj_model, self.obsd_mj_data)
-
-    # Methods on paths (should it be a part of path_utils?) =================================
-
-    def compute_path_rewards(self, paths):
+    def get_visual(self, visual_keys=None):
         """
-        Compute vectorized rewards for paths and check for done conditions
-        path has two keys: observations and actions
-        path["observations"] : (num_traj, horizon, obs_dim)
-        path["rewards"] should have shape (num_traj, horizon)
+        Return visual observations
+        NOTE: Following get_obs() call is very important as camera renders depend on obs_dict computations
         """
-        obs_dict = self.obsvec2obsdict(paths["observations"])
-        rwd_dict = self.get_reward_dict(obs_dict)
+        visual_keys = visual_keys if visual_keys else self.visual_keys
+        visual_dict = {}
+        return visual_dict
 
-        rewards = rwd_dict[self.rwd_mode]
-        done = rwd_dict["done"]
-        # time align rewards. last step is redundant
-        done[..., :-1] = done[..., 1:]
-        rewards[..., :-1] = rewards[..., 1:]
-        paths["done"] = done if done.shape[0] > 1 else done.ravel()
-        paths["rewards"] = rewards if rewards.shape[0] > 1 else rewards.ravel()
-        return paths
+    def is_done(self):
+        """
+        Returns if environment (episode) is done (bool). This could be done due to termination or truncation
+        This function is implemented seperately from is_terminate() and is_truncate() with following requirements:
+            - output from is_done() is equivalent to: is_terminate() or is_truncate()
+            - is_done() could be efficient by directly using single condition instead of evaluating two conditions via the above equation.
+            - is_done()/is_terminate()/is_truncate() are consistent
+        """
+        return False
 
-    def truncate_paths(self, paths):
+    def is_terminate(self):
         """
-        truncate paths as per done condition
+        Returns if environment episode is terminated (bool). Termination is when task requirements have changed
         """
-        hor = paths[0]["rewards"].shape[0]
-        for path in paths:
-            if path["done"][-1] == False:
-                path["terminated"] = False
-                terminated_idx = hor
-            elif path["done"][0] == False:
-                terminated_idx = sum(~path["done"]) + 1
-                for key in path.keys():
-                    path[key] = path[key][: terminated_idx + 1, ...]
-                path["terminated"] = True
-        return paths
+        return False
 
-    def evaluate_success(self, paths, logger=None, successful_steps=5):
+    def is_truncate(self):
         """
-        Evaluate paths and log metrics to logger
+        Returns if environment episode is truncated (bool). Truncation is when task has timed-out
+        """
+        return False
+
+    def reset_model(self):
+        """
+        resets model/ mujoco data
+        """
+        # resolve init pos
+        init_qpos = self.init_qpos.copy()
+        if hasattr(self, "init_qpos_noise"):
+            if self.init_qpos_noise > 0:
+                self.np_random.uniform(
+                    low=-self.init_qpos_noise,
+                    high=self.init_qpos_noise,
+                    size=init_qpos.shape[0],
+                )
+                init_qpos = init_qpos + self.np_random.uniform(
+                    low=-self.init_qpos_noise,
+                    high=self.init_qpos_noise,
+                    size=init_qpos.shape[0],
+                )
+
+        # resolve init vel
+        init_qvel = self.init_qvel.copy()
+        if hasattr(self, "init_qvel_noise"):
+            if self.init_qvel_noise > 0:
+                init_qvel = init_qvel + self.np_random.uniform(
+                    low=-self.init_qvel_noise,
+                    high=self.init_qvel_noise,
+                    size=init_qvel.shape[0],
+                )
+
+        # set pos/vel
+        self.robot.sync_sims(self.mj_model, self.mj_data)
+        self.mj_data.qpos[:] = init_qpos
+        self.mj_data.qvel[:] = init_qvel
+        mujoco.mj_forward(self.mj_model, self.mj_data)
+
+        # update times
+        self.env_step = 0
+        return self.get_obs()
+
+    def reset(self, seed=None, options=None):
+        obs = self.reset_model()
+
+        # TODO: Move back to  new gym paradigm
+        if seed is None:
+            return obs
+        else:
+            return obs, {}
+
+    def get_reward_dict(self):
+        """
+        Compute rewards for environment
+        """
+        rwd_dict = {}
+        return rwd_dict
+
+    def is_success(self, paths):
+        """
+        Returns success status of path
+        """
+        return 0
+
+    def step(self, a):
+        """
+        env step
+        """
+        pre_physics_time = self.mj_data.time
+        pre_physics_step = self.env_step
+
+        # apply action and step physics + robot
+        for _ in range(self.frame_skip):
+            if self.normalize_act:
+                a = tensor_utils.denormalize(
+                    a,
+                    self.mj_model.actuator_ctrlrange[:, 0],
+                    self.mj_model.actuator_ctrlrange[:, 1],
+                )
+            self.robot.step(a, self.mj_model, self.mj_data)
+            mujoco.mj_step(self.mj_model, self.mj_data)
+
+        # update times
+        self.env_step += 1
+
+        # observation is computed after simtime is incremented by the physics step
+        obs = self.get_obs()
+
+        # reward is computed after obs
+        self.rwd_dict = self.get_reward_dict()
+        reward = self.rwd_dict["rwd_total"] if "rwd_total" in self.rwd_dict.keys() else 0.0
+        reward = reward.item() if hasattr(reward, 'item') else reward  # handle numpy scalars
+
+        # termination and truncation
+        done = self.is_done()
+        terminated = self.is_terminate()
+        truncated = self.is_truncate()
+
+        # new gym paradigm, check #231
+        info = dict(rwd_dict=self.rwd_dict,
+                    obs_dict=self.obs_dict,
+                    terminated=terminated,
+                    truncated=truncated,
+                    done=done)
+        return obs, reward, done, info
+
+    # Close env
+    def close(self):
+        if hasattr(self, "mj_renderer") and self.mj_renderer:
+            self.mj_renderer.close()
+
+    def viewer_setup(self):
+        """
+        Setup viewer for environments with visualization support
+        """
+        pass
+
+    def set_camera(self, camera_name="cam_01"):
+        """
+        Set viewer to camera given camera name
+        """
+        pass
+
+    def set_rgb_from_camera(self, img):
+        img = np.flipud(img)
+        self.viewer.display_image(img)
+
+    def evaluate_success(self, paths, logger=None):
+        """
+        Evaluate paths and log metrics to logger.
         """
         num_success = 0
         num_paths = len(paths)
 
-        # Record success if solved for provided successful_steps
+        # Record success if solved
         for path in paths:
-            if np.sum(path["env_infos"]["solved"] * 1.0) > successful_steps:
-                # sum of truth values may not work correctly if dtype=object, need to * 1.0
+            if np.mean(path["env_infos"]["solved"]) > 0.0:
                 num_success += 1
         success_percentage = num_success * 100.0 / num_paths
 
-        # log stats
+        # Log metrics
         if logger:
-            rwd_sparse = np.mean(
-                [np.mean(p["env_infos"]["rwd_sparse"]) for p in paths]
-            )  # return rwd/step
-            rwd_dense = np.mean(
-                [np.sum(p["env_infos"]["rwd_dense"]) / self.horizon for p in paths]
-            )  # return rwd/step
-            logger.log_kv("rwd_sparse", rwd_sparse)
-            logger.log_kv("rwd_dense", rwd_dense)
             logger.log_kv("success_percentage", success_percentage)
 
         return success_percentage
 
-    # Vizualization utilities ================================================
+    # record video of an episode
+    def record_episode(self, episode_length=None, out_dir=None, prefix="MyoSuite_"):
+        if out_dir is None:
+            out_dir = os.getcwd()
+        out_path = os.path.join(out_dir, prefix + str(timer.time()))
 
-    def mj_render(self):
-        """
-        Render the default camera
-        """
-        self.mj_renderer.render_to_window()
+        if episode_length is None:
+            episode_length = self.env_horizon
 
-    def viewer_setup(
-        self,
-        distance=2.5,
-        azimuth=90,
-        elevation=-30,
-        lookat=None,
-        render_actuator=None,
-        render_tendon=None,
-    ):
-        """
-        Setup the default camera
-        """
-        self.mj_renderer.set_free_camera_settings(
-            distance=distance, azimuth=azimuth, elevation=elevation, lookat=lookat
-        )
-        self.mj_renderer.set_viewer_settings(
-            render_actuator=render_actuator, render_tendon=render_tendon
-        )
+        frames = []
+        obs = self.reset()
+        for i in range(episode_length):
+            self.env.render()
+            frames.append(self.get_offscreen_rgb())
+            obs, *_ = self.step(self.action_space.sample())
 
-    # Methods on policy (should it be a part of utils?) =================================
-    def examine_policy(
-        self,
-        policy,
-        horizon=1000,
-        num_episodes=1,
-        mode="exploration",  # options: exploration/evaluation
-        render=None,  # options: onscreen/offscreen/none
-        camera_name=None,
-        frame_size=(640, 480),
-        output_dir="/tmp/",
-        filename="newvid",
-        device_id: int = 0,
-    ):
-        """
-        Examine a policy for behaviors;
-        - either onscreen, or offscreen, or just rollout without rendering.
-        - return resulting paths
-        """
-        exp_t0 = timer.time()
+        skvideo.io.vwrite(out_path, np.asarray(frames), inputdict={"-r": str(1 / 0.01)})
 
-        if render == "onscreen":
-            self.mujoco_render_frames = True
-        elif render == "offscreen":
-            self.mujoco_render_frames = False
-            frames = np.zeros(
-                (horizon, frame_size[1], frame_size[0], 3), dtype=np.uint8
-            )
-        elif render == None or render == "None" or render == "none":
-            self.mujoco_render_frames = False
+    def get_offscreen_rgb(self, camera_name=None):
+        # option1: opencv rendering (computationally slow)
+        # from myosuite.renderer.recorder import opencv_renderer
+        # offscreen_rgb = opencv_renderer.opencv_render(model=self.mj_model, data=self.mj_data, height=256, width=256, camera_name=camera_name)
 
-        # start rollouts
-        paths = []
-        for ep in range(num_episodes):
-            ep_t0 = timer.time()
-            observations = []
-            actions = []
-            rewards = []
-            agent_infos = []
-            env_infos = []
-
-            prompt("Episode %d" % ep, end=":> ", type=Prompt.INFO)
-            o = self.reset()
-            done = False
-            t = 0
-            ep_rwd = 0.0
-            while t < horizon and done is False:
-                a = (
-                    policy.get_action(o)[0]
-                    if mode == "exploration"
-                    else policy.get_action(o)[1]["evaluation"]
-                )
-                next_o, rwd, done, *_, env_info = self.step(a)
-                ep_rwd += rwd
-                # render offscreen visuals
-                if render == "offscreen":
-                    curr_frame = self.mj_renderer.render_offscreen(
-                        width=frame_size[0],
-                        height=frame_size[1],
-                        camera_id=camera_name,
-                        device_id=device_id,
-                    )
-
-                    frames[t, :, :, :] = curr_frame
-                    prompt(t, end=", ", flush=True, type=Prompt.INFO)
-                observations.append(o)
-                actions.append(a)
-                rewards.append(rwd)
-                # agent_infos.append(agent_info)
-                env_infos.append(env_info)
-                o = next_o
-                t = t + 1
-
-            prompt(
-                "Total reward = %3.3f, Total time = %2.3f"
-                % (ep_rwd, timer.time() - ep_t0),
-                type=Prompt.INFO,
-            )
-            path = dict(
-                observations=np.array(observations),
-                actions=np.array(actions),
-                rewards=np.array(rewards),
-                # agent_infos=tensor_utils.stack_tensor_dict_list(agent_infos),
-                env_infos=tensor_utils.stack_tensor_dict_list(env_infos),
-                terminated=done,
-            )
-            paths.append(path)
-
-            # save offscreen buffers as video
-            if render == "offscreen":
-                file_name = output_dir + filename + str(ep) + ".mp4"
-                # check if the platform is OS -- make it compatible with quicktime
-                if platform == "darwin":
-                    skvideo.io.vwrite(
-                        file_name,
-                        np.asarray(frames),
-                        outputdict={"-pix_fmt": "yuv420p"},
-                    )
-                else:
-                    skvideo.io.vwrite(file_name, np.asarray(frames))
-                prompt("saved", file_name, type=Prompt.INFO)
-
-        self.mujoco_render_frames = False
-        prompt("Total time taken = %f" % (timer.time() - exp_t0), type=Prompt.INFO)
-        return paths
-
-    def examine_policy_new(
-        self,
-        policy,
-        horizon=1000,
-        num_episodes=1,
-        mode="exploration",  # options: exploration/evaluation
-        render=None,  # options: onscreen/offscreen/none
-        camera_name=None,
-        frame_size=(640, 480),
-        output_dir="/tmp/",
-        filename="newvid",
-        device_id: int = 0,
-    ):
-        """
-        Examine a policy for behaviors;
-        - either onscreen, or offscreen, or just rollout without rendering.
-        - return resulting paths
-        """
-
-        # from myosuite.logger.roboset_logger import RoboSet_Trace as Trace
-        from myosuite.logger.grouped_datasets import Trace
-
-        trace = Trace(self.id + "_rollouts")
-
-        exp_t0 = timer.time()
-
-        if render == "onscreen":
-            self.mujoco_render_frames = True
-        elif render == "offscreen":
-            self.mujoco_render_frames = False
-            frames = np.zeros(
-                (horizon, frame_size[1], frame_size[0], 3), dtype=np.uint8
-            )
-        elif render == None or render == "None" or render == "none":
-            self.mujoco_render_frames = False
-
-        # start rollouts
-        for ep in range(num_episodes):
-
-            # initialize -----------------------------
-            ep_t0 = timer.time()
-            group_key = "Trial" + str(ep)
-            trace.create_group(group_key)
-            prompt(f"Episode {ep}", end=":> ", type=Prompt.INFO)
-            obs = self.reset()
-            done = False
-            t = 0
-            ep_rwd = 0.0
-
-            # Rollout --------------------------------
-            obs, rwd, done, *_, env_info = self.forward(
-                update_exteroception=True
-            )  # t=0
-            while t < horizon and done is False:
-
-                # print(t, t*self.dt, self.time, t*self.dt-self.time)
-                # Get step's actions ----------------------
-                act = (
-                    policy.get_action(obs)[0]
-                    if mode == "exploration"
-                    else policy.get_action(obs)[1]["evaluation"]
-                )
-
-                # render offscreen visuals ----------------------
-                if render == "offscreen":
-                    curr_frame = self.mj_renderer.render_offscreen(
-                        width=frame_size[0],
-                        height=frame_size[1],
-                        camera_id=camera_name,
-                        device_id=device_id,
-                    )
-
-                    frames[t, :, :, :] = curr_frame
-                    prompt(str(t), end=", ", flush=True, type=Prompt.INFO)
-
-                # log values at time=t ----------------------------------
-                datum_dict = dict(
-                    time=self.time,
-                    observations=obs,
-                    actions=act.copy(),
-                    rewards=rwd,
-                    env_infos=env_info,
-                    done=done,
-                )
-                trace.append_datums(group_key=group_key, dataset_key_val=datum_dict)
-
-                # step env using actions from t=>t+1 ----------------------
-                obs, rwd, done, *_, env_info = self.step(act, update_exteroception=True)
-                t = t + 1
-                ep_rwd += rwd
-
-            # record last step and finalize the rollout --------------------------------
-            act = np.nan * np.ones(self.action_space.shape)
-            datum_dict = dict(
-                time=self.time,
-                observations=obs,
-                actions=act.copy(),
-                rewards=rwd,
-                env_infos=env_info,
-                done=done,
-            )
-            trace.append_datums(group_key=group_key, dataset_key_val=datum_dict)
-            prompt(
-                f"Episode {ep}:> Finished in {(timer.time()-ep_t0):0.4} sec. Total rewards {ep_rwd}",
-                type=Prompt.INFO,
-            )
-
-            # save offscreen buffers as video --------------------------------
-            if render == "offscreen":
-                file_name = output_dir + filename + str(ep) + ".mp4"
-                # check if the platform is OS -- make it compatible with quicktime
-                if platform == "darwin":
-                    skvideo.io.vwrite(
-                        file_name,
-                        np.asarray(frames),
-                        outputdict={"-pix_fmt": "yuv420p"},
-                    )
-                else:
-                    skvideo.io.vwrite(file_name, np.asarray(frames))
-                prompt("saved: " + file_name, type=Prompt.ALWAYS)
-
-        self.mujoco_render_frames = False
-        prompt("Total time taken = %f" % (timer.time() - exp_t0), type=Prompt.INFO)
-        trace.stack()
-        return trace
-
-    # methods to override ====================================================
-
-    def get_obs_dict(self, mj_model, mj_data):
-        """
-        Get observation dictionary
-        Implement this in each subclass.
-        Note: Visual observations are automatically calculated via call to get_visual_obs_dict() from within get_obs()
-            visual obs can be specified via visual keys of the form rgb:cam_name:HxW:encoder where cam_name is the name
-            of the camera, HxW is the frame size and encode is the encoding of the image (can be 1d/2d as well as image encoders like rrl/r3m etc)
-        """
-        raise NotImplementedError
-
-    def get_reward_dict(self, obs_dict):
-        """
-        Compute rewards dictionary
-        Implement this in each subclass.
-        """
-        raise NotImplementedError
+        # option2: mujoco rendering (optimized)
+        return self.mj_renderer.render_offscreen_rgb(camera_name=camera_name)
