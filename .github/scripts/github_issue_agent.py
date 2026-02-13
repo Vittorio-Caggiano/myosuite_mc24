@@ -15,7 +15,7 @@ class GitHubIssueAgent:
     def __init__(self, github_token: str, anthropic_api_key: str):
         """
         Initialize the GitHub Issue Agent
-
+        
         Args:
             github_token: GitHub personal access token
             anthropic_api_key: Anthropic API key for Claude
@@ -26,20 +26,20 @@ class GitHubIssueAgent:
             "Authorization": f"token {github_token}",
             "Accept": "application/vnd.github.v3+json"
         }
-
+    
     def get_repository_context(self, owner: str, repo: str) -> Dict:
         """
         Gather repository context including README, structure, and recent commits
         """
         base_url = f"https://api.github.com/repos/{owner}/{repo}"
-
+        
         context = {
             "repo_info": {},
             "readme": "",
             "structure": [],
             "recent_commits": []
         }
-
+        
         # Get repository info
         response = requests.get(base_url, headers=self.github_headers)
         if response.status_code == 200:
@@ -50,7 +50,7 @@ class GitHubIssueAgent:
                 "language": repo_data.get("language"),
                 "topics": repo_data.get("topics", [])
             }
-
+        
         # Get README
         try:
             readme_response = requests.get(
@@ -66,7 +66,7 @@ class GitHubIssueAgent:
                 ).decode('utf-8')
         except Exception as e:
             print(f"Could not fetch README: {e}")
-
+        
         # Get repository tree (file structure)
         try:
             tree_response = requests.get(
@@ -80,7 +80,7 @@ class GitHubIssueAgent:
                 ]
         except Exception as e:
             print(f"Could not fetch repository structure: {e}")
-
+        
         # Get recent commits
         try:
             commits_response = requests.get(
@@ -99,19 +99,19 @@ class GitHubIssueAgent:
                 ]
         except Exception as e:
             print(f"Could not fetch recent commits: {e}")
-
+        
         return context
-
+    
     def get_issue_details(self, owner: str, repo: str, issue_number: int) -> Dict:
         """
         Fetch detailed information about a specific issue
         """
         url = f"https://api.github.com/repos/{owner}/{repo}/issues/{issue_number}"
         response = requests.get(url, headers=self.github_headers)
-
+        
         if response.status_code == 200:
             issue_data = response.json()
-
+            
             # Get comments
             comments = []
             if issue_data.get("comments", 0) > 0:
@@ -130,7 +130,7 @@ class GitHubIssueAgent:
                         }
                         for comment in comments_data
                     ]
-
+            
             return {
                 "number": issue_data["number"],
                 "title": issue_data["title"],
@@ -144,7 +144,7 @@ class GitHubIssueAgent:
             }
         else:
             raise Exception(f"Failed to fetch issue: {response.status_code}")
-
+    
     def analyze_issue(
         self,
         owner: str,
@@ -154,15 +154,25 @@ class GitHubIssueAgent:
     ) -> Dict:
         """
         Analyze an issue using Claude and provide a resolution plan
+        
+        Args:
+            owner: Repository owner
+            repo: Repository name
+            issue_number: Issue number to analyze
+            extended_thinking: Use Claude's extended thinking capability
+        
+        Returns:
+            Dictionary containing analysis and action plan
         """
         print(f"Fetching repository context for {owner}/{repo}...")
         repo_context = self.get_repository_context(owner, repo)
-
+        
         print(f"Fetching issue #{issue_number} details...")
         issue = self.get_issue_details(owner, repo, issue_number)
-
+        
         print("Analyzing issue with Claude...")
-
+        
+        # Construct the prompt for Claude
         prompt = f"""You are a GitHub issue analysis agent. Your task is to analyze the following issue in the context of the repository and provide a structured action plan.
 
 REPOSITORY CONTEXT:
@@ -218,6 +228,7 @@ Please analyze this issue and provide:
 
 Please structure your response in a clear, actionable format."""
 
+        # Call Claude API
         kwargs = {
             "model": "claude-sonnet-4-20250514",
             "max_tokens": 4096,
@@ -234,16 +245,17 @@ Please structure your response in a clear, actionable format."""
                 "budget_tokens": 3000
             }
         response = self.client.messages.create(**kwargs)
-
+        
+        # Extract the analysis from response
         analysis_text = ""
         thinking_text = ""
-
+        
         for block in response.content:
             if block.type == "thinking":
                 thinking_text = block.thinking
             elif block.type == "text":
                 analysis_text = block.text
-
+        
         result = {
             "issue_number": issue_number,
             "issue_title": issue['title'],
@@ -256,9 +268,9 @@ Please structure your response in a clear, actionable format."""
                 "output": response.usage.output_tokens
             }
         }
-
+        
         return result
-
+    
     def post_analysis_comment(
         self,
         owner: str,
@@ -269,27 +281,27 @@ Please structure your response in a clear, actionable format."""
         """
         Post the analysis as a comment on the GitHub issue
         """
-        comment_body = f"""## AI Analysis Report
+        comment_body = f"""## 🤖 AI Analysis Report
 
 {analysis['analysis']}
 
 ---
 *Generated by Claude Issue Agent*
-*Model: {analysis['model_used']} | Tokens: {analysis['tokens_used']['input']}->{analysis['tokens_used']['output']}*
+*Model: {analysis['model_used']} | Tokens: {analysis['tokens_used']['input']}→{analysis['tokens_used']['output']}*
 """
-
+        
         url = f"https://api.github.com/repos/{owner}/{repo}/issues/{issue_number}/comments"
         response = requests.post(
             url,
             headers=self.github_headers,
             json={"body": comment_body}
         )
-
+        
         if response.status_code == 201:
-            print(f"Analysis posted to issue #{issue_number}")
+            print(f"✓ Analysis posted to issue #{issue_number}")
             return True
         else:
-            print(f"Failed to post comment: {response.status_code}")
+            print(f"✗ Failed to post comment: {response.status_code}")
             return False
 
 
@@ -302,6 +314,41 @@ Please structure your response in a clear, actionable format."""
             return base64.b64decode(response.json()["content"]).decode("utf-8")
         return None
 
+    def search_code(self, owner: str, repo: str, query: str, per_page: int = 100) -> List[Dict]:
+        """
+        Search for code patterns in the repository using GitHub Code Search API.
+        Returns list of {path, matches} for files containing the query.
+        """
+        search_headers = {**self.github_headers, "Accept": "application/vnd.github.text-match+json"}
+        url = "https://api.github.com/search/code"
+        params = {"q": f"{query} repo:{owner}/{repo}", "per_page": per_page}
+        response = requests.get(url, headers=search_headers, params=params)
+        if response.status_code == 200:
+            data = response.json()
+            results = []
+            for item in data.get("items", []):
+                match_info = {
+                    "path": item["path"],
+                    "matches": []
+                }
+                for tm in item.get("text_matches", []):
+                    match_info["matches"].append(tm.get("fragment", ""))
+                results.append(match_info)
+            print(f"  Code search for '{query}': found {len(results)} files")
+            return results
+        else:
+            print(f"  Code search failed: {response.status_code}")
+            return []
+
+    def get_full_tree(self, owner: str, repo: str, ref: str = "main") -> List[str]:
+        """Get the full file tree of the repository (all file paths)."""
+        url = f"https://api.github.com/repos/{owner}/{repo}/git/trees/{ref}?recursive=1"
+        response = requests.get(url, headers=self.github_headers)
+        if response.status_code == 200:
+            return [item["path"] for item in response.json().get("tree", [])
+                    if item["type"] == "blob"]
+        return []
+
     def generate_implementation(
         self,
         owner: str,
@@ -312,51 +359,49 @@ Please structure your response in a clear, actionable format."""
     ) -> Optional[Dict]:
         """
         Ask Claude to generate concrete file changes to resolve the issue.
+        Uses a 3-step approach:
+          1. Ask Claude what search queries to run to find affected files
+          2. Run those searches, collect matching files
+          3. Ask Claude to generate the actual changes
 
-        Returns a dict with keys: changes (list of file edits), pr_title, pr_body.
+        Returns a dict with keys: changes, files, pr_title, pr_body.
         """
-        file_hints = [p for p in repo_context.get("structure", []) if not p.endswith("/")]
+        import re
 
-        prompt = f"""You are a code implementation agent. Based on the following issue and analysis,
-generate the EXACT file changes needed to resolve this issue.
+        all_files = self.get_full_tree(owner, repo)
+        print(f"Repository has {len(all_files)} files total")
+
+        # Step 1: Ask Claude what to search for
+        search_prompt = f"""You are a code implementation agent. For the issue below, I need to find
+ALL files in the repository that need to be modified.
 
 REPOSITORY: {owner}/{repo}
 ISSUE #{issue['number']}: {issue['title']}
+ISSUE BODY: {issue['body'] or '(no description)'}
 
-ISSUE BODY:
-{issue['body'] or '(no description)'}
+ANALYSIS SUMMARY:
+{analysis[:2000]}
 
-ANALYSIS:
-{analysis}
+ALL REPOSITORY FILES ({len(all_files)} files):
+{chr(10).join(all_files)}
 
-REPOSITORY FILES:
-{chr(10).join(file_hints[:80])}
+Tell me:
+1. What code search queries should I run to find ALL affected files?
+   (e.g., for copyright updates, search for "Copyright" and year patterns)
+2. Are there specific file paths from the list above that should be included?
 
-INSTRUCTIONS:
-1. Identify which files need to be modified or created.
-2. For each file, provide the COMPLETE new file content (not a diff).
-3. Only change what is necessary to resolve the issue.
-4. Keep changes minimal and focused.
-
-Respond with ONLY a JSON object (no markdown fences) in this exact format:
+Respond with ONLY a JSON object (no markdown fences):
 {{
+  "search_queries": ["query1", "query2"],
+  "explicit_paths": ["path/to/file1", "path/to/file2"],
   "pr_title": "Short PR title (under 70 chars)",
-  "pr_body": "Description of what changes were made and why",
-  "changes": [
-    {{
-      "path": "relative/file/path",
-      "description": "What was changed in this file"
-    }}
-  ]
-}}
-
-List the files that need changing. I will then provide their current contents
-so you can generate the updated versions."""
+  "pr_body": "Description of what changes will be made and why"
+}}"""
 
         response = self.client.messages.create(
             model="claude-sonnet-4-20250514",
             max_tokens=4096,
-            messages=[{"role": "user", "content": prompt}],
+            messages=[{"role": "user", "content": search_prompt}],
         )
 
         plan_text = ""
@@ -368,92 +413,119 @@ so you can generate the updated versions."""
         try:
             plan = json.loads(plan_text)
         except json.JSONDecodeError:
-            import re
             match = re.search(r'\{[\s\S]*\}', plan_text)
             if match:
                 plan = json.loads(match.group())
             else:
-                print("Failed to parse implementation plan from Claude response")
+                print("Failed to parse search plan from Claude response")
                 return None
 
-        # Fetch current file contents and ask Claude to generate updated versions
-        file_contents = {}
-        for change in plan.get("changes", []):
-            path = change["path"]
-            content = self.get_file_content(owner, repo, path)
-            if content is not None:
-                file_contents[path] = content
-            else:
-                file_contents[path] = None  # new file
+        # Step 2: Run the searches and collect all affected file paths
+        affected_paths = set(plan.get("explicit_paths", []))
 
-        files_context = ""
-        for path, content in file_contents.items():
-            if content is not None:
-                files_context += f"\n--- FILE: {path} ---\n{content}\n--- END FILE ---\n"
-            else:
-                files_context += f"\n--- FILE: {path} (NEW FILE) ---\n--- END FILE ---\n"
+        for query in plan.get("search_queries", []):
+            results = self.search_code(owner, repo, query)
+            for r in results:
+                affected_paths.add(r["path"])
 
-        implementation_prompt = f"""Based on the plan below, generate the COMPLETE updated content for each file.
+        # Filter to paths that actually exist in the tree
+        valid_paths = [p for p in affected_paths if p in all_files]
+        print(f"Found {len(valid_paths)} files to potentially modify")
+
+        if not valid_paths:
+            print("No files found to modify.")
+            return None
+
+        # Step 3: Fetch all affected files and ask Claude to generate changes
+        # Process in batches to stay within API limits
+        MAX_FILES_PER_BATCH = 15
+        all_changes = []
+        all_impl_files = []
+
+        for batch_start in range(0, len(valid_paths), MAX_FILES_PER_BATCH):
+            batch_paths = valid_paths[batch_start:batch_start + MAX_FILES_PER_BATCH]
+            batch_num = batch_start // MAX_FILES_PER_BATCH + 1
+            total_batches = (len(valid_paths) + MAX_FILES_PER_BATCH - 1) // MAX_FILES_PER_BATCH
+            print(f"Processing batch {batch_num}/{total_batches} ({len(batch_paths)} files)...")
+
+            files_context = ""
+            for path in batch_paths:
+                content = self.get_file_content(owner, repo, path)
+                if content is not None:
+                    files_context += f"\n--- FILE: {path} ---\n{content}\n--- END FILE ---\n"
+
+            implementation_prompt = f"""You are a code implementation agent. Apply the MINIMAL changes needed
+to resolve the issue for EACH file below.
 
 ISSUE #{issue['number']}: {issue['title']}
 ISSUE BODY: {issue['body'] or '(no description)'}
 
-PLAN:
-PR Title: {plan['pr_title']}
-PR Body: {plan['pr_body']}
-Files to change:
-{json.dumps(plan['changes'], indent=2)}
+TASK: {plan['pr_body']}
 
 CURRENT FILE CONTENTS:
 {files_context}
 
-Respond with ONLY a JSON object (no markdown fences) in this exact format:
+For each file, decide if it actually needs changes. If a file does NOT need
+changes (e.g., the search matched but the content is already correct), skip it.
+
+Respond with ONLY a JSON object (no markdown fences):
 {{
   "files": [
     {{
       "path": "relative/file/path",
-      "content": "COMPLETE new file content here"
+      "content": "COMPLETE updated file content",
+      "description": "What was changed"
     }}
   ]
 }}
 
 IMPORTANT:
-- Provide the COMPLETE file content, not just the changed parts.
-- For existing files, include ALL original content with only the necessary modifications.
-- For new files, provide the full content."""
+- Only include files that ACTUALLY need changes.
+- Provide the COMPLETE file content for each changed file.
+- Make ONLY the changes needed to resolve the issue — nothing else."""
 
-        impl_response = self.client.messages.create(
-            model="claude-sonnet-4-20250514",
-            max_tokens=16000,
-            messages=[{"role": "user", "content": implementation_prompt}],
-        )
+            impl_response = self.client.messages.create(
+                model="claude-sonnet-4-20250514",
+                max_tokens=16000,
+                messages=[{"role": "user", "content": implementation_prompt}],
+            )
 
-        impl_text = ""
-        for block in impl_response.content:
-            if block.type == "text":
-                impl_text = block.text
-                break
+            impl_text = ""
+            for block in impl_response.content:
+                if block.type == "text":
+                    impl_text = block.text
+                    break
 
-        try:
-            impl = json.loads(impl_text)
-        except json.JSONDecodeError:
-            import re
-            match = re.search(r'\{[\s\S]*\}', impl_text)
-            if match:
-                impl = json.loads(match.group())
-            else:
-                print("Failed to parse implementation from Claude response")
-                return None
+            try:
+                impl = json.loads(impl_text)
+            except json.JSONDecodeError:
+                match = re.search(r'\{[\s\S]*\}', impl_text)
+                if match:
+                    impl = json.loads(match.group())
+                else:
+                    print(f"  Failed to parse batch {batch_num} response, skipping")
+                    continue
+
+            for f in impl.get("files", []):
+                all_impl_files.append({"path": f["path"], "content": f["content"]})
+                all_changes.append({"path": f["path"], "description": f.get("description", "Updated")})
+
+        if not all_impl_files:
+            print("No file changes were generated.")
+            return None
+
+        print(f"Total files to change: {len(all_impl_files)}")
 
         return {
             "pr_title": plan["pr_title"],
             "pr_body": plan["pr_body"],
-            "changes": plan["changes"],
-            "files": impl["files"],
+            "changes": all_changes,
+            "files": all_impl_files,
         }
 
     def create_branch(self, owner: str, repo: str, branch_name: str, base_ref: str = "main") -> bool:
         """Create a new branch from base_ref."""
+        # Get the SHA of the base branch
         url = f"https://api.github.com/repos/{owner}/{repo}/git/ref/heads/{base_ref}"
         response = requests.get(url, headers=self.github_headers)
         if response.status_code != 200:
@@ -462,6 +534,7 @@ IMPORTANT:
 
         base_sha = response.json()["object"]["sha"]
 
+        # Create the new branch
         url = f"https://api.github.com/repos/{owner}/{repo}/git/refs"
         response = requests.post(
             url,
@@ -580,7 +653,7 @@ IMPORTANT:
         self, owner: str, repo: str, issue_number: int, analysis_result: Dict
     ) -> Optional[str]:
         """
-        Full implementation flow: generate changes -> create branch -> commit -> open PR.
+        Full implementation flow: generate changes → create branch → commit → open PR.
         Returns the PR URL or None.
         """
         print(f"\nGenerating implementation for issue #{issue_number}...")

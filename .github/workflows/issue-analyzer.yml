@@ -25,10 +25,14 @@ jobs:
   analyze-issue:
     runs-on: ubuntu-latest
 
+    # Trigger on: manual dispatch, 'auto-fix' label (analysis + PR),
+    # or 'test-analysis' label (analysis only)
     if: |
       (github.event_name == 'workflow_dispatch') ||
-      (github.event_name == 'issues' &&
-       contains(github.event.issue.labels.*.name, 'test-analysis'))
+      (github.event_name == 'issues' && (
+        contains(github.event.issue.labels.*.name, 'auto-fix') ||
+        contains(github.event.issue.labels.*.name, 'test-analysis')
+      ))
 
     steps:
       - name: Checkout repository
@@ -43,6 +47,23 @@ jobs:
         run: |
           pip install anthropic requests
 
+      - name: Determine if PR should be created
+        id: config
+        run: |
+          # auto-fix label → always create PR
+          # test-analysis label → analysis only (no PR)
+          # manual dispatch → use the create_pr input
+          if [ "${{ github.event_name }}" = "issues" ]; then
+            LABELS='${{ toJSON(github.event.issue.labels.*.name) }}'
+            if echo "$LABELS" | grep -q "auto-fix"; then
+              echo "create_pr=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "create_pr=false" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            echo "create_pr=${{ github.event.inputs.create_pr || 'true' }}" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Run Issue Analysis & Implementation
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -51,7 +72,7 @@ jobs:
           REPO_OWNER: ${{ github.repository_owner }}
           REPO_NAME: ${{ github.event.repository.name }}
           IS_TEST: 'false'
-          CREATE_PR: ${{ github.event.inputs.create_pr || 'true' }}
+          CREATE_PR: ${{ steps.config.outputs.create_pr }}
         run: |
           python .github/scripts/run_analysis.py
 
