@@ -57,13 +57,32 @@ def main():
     else:
         agent.post_analysis_comment(repo_owner, repo_name, issue_number, result)
 
+    # Phase 2: Implementation — generate changes and open a PR
+    create_pr = os.getenv("CREATE_PR", "false").lower() == "true"
+    pr_url = None
+
+    if create_pr and not is_test:
+        print("\n--- Implementation Phase ---")
+        try:
+            pr_url = agent.implement_issue(repo_owner, repo_name, issue_number, result)
+            if pr_url:
+                print(f"PR created: {pr_url}")
+            else:
+                print("No PR was created (no changes needed or an error occurred).")
+        except Exception as e:
+            print(f"Implementation phase failed: {e}")
+    elif create_pr and is_test:
+        print("\n[TEST MODE] Skipping PR creation.")
+
     output_path = os.getenv("GITHUB_OUTPUT")
     if output_path:
         with open(output_path, "a") as f:
             f.write(f"analysis_status=success\n")
             f.write(f"issue_number={issue_number}\n")
+            if pr_url:
+                f.write(f"pr_url={pr_url}\n")
 
-    print("\nAnalysis complete.")
+    print("\nDone.")
 
 
 if __name__ == "__main__":
