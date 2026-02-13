@@ -8,16 +8,24 @@ create PRs with fixes. Claude drives the process using GitHub API tools.
 import base64
 import json
 import re
+import time
 import requests
 import anthropic
 from typing import Dict, List, Optional
+
+# Timeout for all HTTP requests (seconds)
+REQUEST_TIMEOUT = 30
+# Max file size to return to Claude (characters)
+MAX_FILE_SIZE = 15000
+# Max agent turns for implementation
+MAX_AGENT_TURNS = 20
 
 
 # --- Tool definitions for Claude ---
 IMPLEMENTATION_TOOLS = [
     {
         "name": "search_code",
-        "description": "Search for code patterns in the repository using GitHub Code Search. Use this to find ALL files that contain a specific pattern (e.g., copyright notices, specific function names, outdated imports).",
+        "description": "Search for code patterns in the repository using GitHub Code Search. Limited to 3 searches per session — use wisely with specific queries.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -31,15 +39,29 @@ IMPLEMENTATION_TOOLS = [
     },
     {
         "name": "list_files",
-        "description": "List all files in the repository. Returns the full file tree.",
+        "description": "List all files in the repository. Returns the full file tree. Prefer list_directory for browsing specific folders.",
         "input_schema": {
             "type": "object",
             "properties": {},
         }
     },
     {
+        "name": "list_directory",
+        "description": "List files and subdirectories in a specific directory. Use this to explore the repository structure before reading files. Much faster than list_files for targeted browsing.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Directory path relative to repo root (e.g., 'src', 'myosuite/envs'). Use '' for root."
+                }
+            },
+            "required": ["path"]
+        }
+    },
+    {
         "name": "read_file",
-        "description": "Read the content of a specific file in the repository.",
+        "description": "Read the content of a specific file (not a directory). Use list_directory to explore directories first.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -133,22 +155,43 @@ IMPLEMENTATION_TOOLS = [
 class GitHubTools:
     """Executes GitHub API operations on behalf of Claude's tool calls."""
 
+    MAX_SEARCHES = 3  # Limit search_code calls to prevent endless searching
+
     def __init__(self, github_token: str, owner: str, repo: str, issue_number: int):
         self.owner = owner
         self.repo = repo
         self.issue_number = issue_number
+        self.search_count = 0
         self.headers = {
             "Authorization": f"token {github_token}",
             "Accept": "application/vnd.github.v3+json",
         }
         self.base_url = f"https://api.github.com/repos/{owner}/{repo}"
 
+    def _check_rate_limit(self, resp):
+        """Check GitHub API rate limit and wait if needed."""
+        remaining = resp.headers.get("X-RateLimit-Remaining")
+        if remaining and int(remaining) < 5:
+            reset = int(resp.headers.get("X-RateLimit-Reset", 0))
+            wait = max(reset - int(time.time()), 1)
+            print(f"    Rate limit low ({remaining} remaining), waiting {wait}s...")
+            time.sleep(min(wait, 60))
+
     def search_code(self, query: str) -> str:
+        self.search_count += 1
+        if self.search_count > self.MAX_SEARCHES:
+            return (f"Search limit reached ({self.MAX_SEARCHES} searches used). "
+                    "Use list_directory and read_file to find remaining files, "
+                    "then proceed to create_branch and write_file.")
         search_headers = {**self.headers, "Accept": "application/vnd.github.text-match+json"}
-        params = {"q": f"{query} repo:{self.owner}/{self.repo}", "per_page": 100}
-        resp = requests.get("https://api.github.com/search/code", headers=search_headers, params=params)
+        params = {"q": f"{query} repo:{self.owner}/{self.repo}", "per_page": 30}
+        resp = requests.get("https://api.github.com/search/code",
+                            headers=search_headers, params=params, timeout=REQUEST_TIMEOUT)
+        self._check_rate_limit(resp)
+        if resp.status_code == 403:
+            return "Search rate limited. Use list_directory and read_file instead."
         if resp.status_code != 200:
-            return f"Search failed: {resp.status_code}"
+            return f"Search failed: {resp.status_code}. Use list_directory and read_file instead."
         items = resp.json().get("items", [])
         results = []
         for item in items:
@@ -157,30 +200,59 @@ class GitHubTools:
         return json.dumps(results, indent=2)
 
     def list_files(self) -> str:
-        resp = requests.get(f"{self.base_url}/git/trees/main?recursive=1", headers=self.headers)
+        resp = requests.get(f"{self.base_url}/git/trees/main?recursive=1",
+                            headers=self.headers, timeout=REQUEST_TIMEOUT)
         if resp.status_code != 200:
             return f"Failed to list files: {resp.status_code}"
         paths = [item["path"] for item in resp.json().get("tree", []) if item["type"] == "blob"]
         return json.dumps(paths)
 
+    def list_directory(self, path: str) -> str:
+        """List contents of a specific directory."""
+        clean_path = path.strip("/").strip()
+        if not clean_path or clean_path == ".":
+            clean_path = ""
+        url = f"{self.base_url}/contents/{clean_path}" if clean_path else f"{self.base_url}/contents/"
+        resp = requests.get(url, headers=self.headers, params={"ref": "main"},
+                            timeout=REQUEST_TIMEOUT)
+        self._check_rate_limit(resp)
+        if resp.status_code != 200:
+            return f"Directory not found: {path} ({resp.status_code})"
+        data = resp.json()
+        if not isinstance(data, list):
+            return f"Not a directory (it's a file). Use read_file instead: {path}"
+        entries = []
+        for item in sorted(data, key=lambda x: (x["type"] != "dir", x["name"])):
+            kind = "dir" if item["type"] == "dir" else "file"
+            size_info = f" ({item.get('size', 0)} bytes)" if kind == "file" else ""
+            entries.append(f"  {kind}: {item['name']}{size_info}")
+        return f"Contents of '{path or '/'}':\n" + "\n".join(entries)
+
     def read_file(self, path: str) -> str:
-        resp = requests.get(f"{self.base_url}/contents/{path}", headers=self.headers, params={"ref": "main"})
+        resp = requests.get(f"{self.base_url}/contents/{path}",
+                            headers=self.headers, params={"ref": "main"}, timeout=REQUEST_TIMEOUT)
+        self._check_rate_limit(resp)
         if resp.status_code != 200:
             return f"File not found: {path} ({resp.status_code})"
-        content = base64.b64decode(resp.json()["content"]).decode("utf-8")
+        data = resp.json()
+        size = data.get("size", 0)
+        if size > 500000:
+            return f"File too large to read ({size} bytes): {path}"
+        content = base64.b64decode(data["content"]).decode("utf-8")
+        if len(content) > MAX_FILE_SIZE:
+            return content[:MAX_FILE_SIZE] + f"\n\n... [TRUNCATED — file is {len(content)} chars, showing first {MAX_FILE_SIZE}]"
         return content
 
     def create_branch(self, branch_name: str) -> str:
-        # Get main HEAD
-        ref_resp = requests.get(f"{self.base_url}/git/ref/heads/main", headers=self.headers)
+        ref_resp = requests.get(f"{self.base_url}/git/ref/heads/main",
+                                headers=self.headers, timeout=REQUEST_TIMEOUT)
         if ref_resp.status_code != 200:
             return f"Failed to get main ref: {ref_resp.status_code}"
         sha = ref_resp.json()["object"]["sha"]
-        # Create branch
         resp = requests.post(
-            f"{self.base_url}/git/refs",
-            headers=self.headers,
+            f"{self.base_url}/git/refs", headers=self.headers,
             json={"ref": f"refs/heads/{branch_name}", "sha": sha},
+            timeout=REQUEST_TIMEOUT,
         )
         if resp.status_code == 201:
             return f"Branch '{branch_name}' created successfully"
@@ -189,11 +261,9 @@ class GitHubTools:
         return f"Failed to create branch: {resp.status_code} {resp.text}"
 
     def write_file(self, path: str, content: str, branch: str, message: str) -> str:
-        # Check if file exists to get its SHA (needed for updates)
         existing = requests.get(
             f"{self.base_url}/contents/{path}",
-            headers=self.headers,
-            params={"ref": branch},
+            headers=self.headers, params={"ref": branch}, timeout=REQUEST_TIMEOUT,
         )
         payload = {
             "message": message,
@@ -203,16 +273,18 @@ class GitHubTools:
         if existing.status_code == 200:
             payload["sha"] = existing.json()["sha"]
 
-        resp = requests.put(f"{self.base_url}/contents/{path}", headers=self.headers, json=payload)
+        resp = requests.put(f"{self.base_url}/contents/{path}",
+                            headers=self.headers, json=payload, timeout=REQUEST_TIMEOUT)
+        self._check_rate_limit(resp)
         if resp.status_code in (200, 201):
             return f"File '{path}' written successfully"
         return f"Failed to write '{path}': {resp.status_code} {resp.text}"
 
     def create_pull_request(self, title: str, body: str, branch: str) -> str:
         resp = requests.post(
-            f"{self.base_url}/pulls",
-            headers=self.headers,
+            f"{self.base_url}/pulls", headers=self.headers,
             json={"title": title, "body": body, "head": branch, "base": "main"},
+            timeout=REQUEST_TIMEOUT,
         )
         if resp.status_code == 201:
             url = resp.json()["html_url"]
@@ -222,8 +294,7 @@ class GitHubTools:
     def post_comment(self, body: str) -> str:
         resp = requests.post(
             f"{self.base_url}/issues/{self.issue_number}/comments",
-            headers=self.headers,
-            json={"body": body},
+            headers=self.headers, json={"body": body}, timeout=REQUEST_TIMEOUT,
         )
         if resp.status_code == 201:
             return "Comment posted"
@@ -234,6 +305,7 @@ class GitHubTools:
         dispatch = {
             "search_code": lambda: self.search_code(tool_input["query"]),
             "list_files": lambda: self.list_files(),
+            "list_directory": lambda: self.list_directory(tool_input["path"]),
             "read_file": lambda: self.read_file(tool_input["path"]),
             "create_branch": lambda: self.create_branch(tool_input["branch_name"]),
             "write_file": lambda: self.write_file(
@@ -268,7 +340,7 @@ class GitHubIssueAgent:
         base_url = f"https://api.github.com/repos/{owner}/{repo}"
         context = {"repo_info": {}, "readme": "", "structure": [], "recent_commits": []}
 
-        resp = requests.get(base_url, headers=self.github_headers)
+        resp = requests.get(base_url, headers=self.github_headers, timeout=REQUEST_TIMEOUT)
         if resp.status_code == 200:
             d = resp.json()
             context["repo_info"] = {
@@ -277,21 +349,21 @@ class GitHubIssueAgent:
             }
 
         try:
-            r = requests.get(f"{base_url}/readme", headers=self.github_headers)
+            r = requests.get(f"{base_url}/readme", headers=self.github_headers, timeout=REQUEST_TIMEOUT)
             if r.status_code == 200:
                 context["readme"] = base64.b64decode(r.json()["content"]).decode("utf-8")
         except Exception:
             pass
 
         try:
-            r = requests.get(f"{base_url}/git/trees/main?recursive=1", headers=self.github_headers)
+            r = requests.get(f"{base_url}/git/trees/main?recursive=1", headers=self.github_headers, timeout=REQUEST_TIMEOUT)
             if r.status_code == 200:
                 context["structure"] = [i["path"] for i in r.json().get("tree", [])[:100]]
         except Exception:
             pass
 
         try:
-            r = requests.get(f"{base_url}/commits?per_page=10", headers=self.github_headers)
+            r = requests.get(f"{base_url}/commits?per_page=10", headers=self.github_headers, timeout=REQUEST_TIMEOUT)
             if r.status_code == 200:
                 context["recent_commits"] = [
                     {"sha": c["sha"][:7], "message": c["commit"]["message"],
@@ -306,14 +378,14 @@ class GitHubIssueAgent:
     def get_issue_details(self, owner: str, repo: str, issue_number: int) -> Dict:
         """Fetch detailed information about a specific issue."""
         url = f"https://api.github.com/repos/{owner}/{repo}/issues/{issue_number}"
-        resp = requests.get(url, headers=self.github_headers)
+        resp = requests.get(url, headers=self.github_headers, timeout=REQUEST_TIMEOUT)
         if resp.status_code != 200:
             raise Exception(f"Failed to fetch issue: {resp.status_code}")
 
         d = resp.json()
         comments = []
         if d.get("comments", 0) > 0:
-            cr = requests.get(d["comments_url"], headers=self.github_headers)
+            cr = requests.get(d["comments_url"], headers=self.github_headers, timeout=REQUEST_TIMEOUT)
             if cr.status_code == 200:
                 comments = [
                     {"author": c["user"]["login"], "body": c["body"], "created_at": c["created_at"]}
@@ -421,7 +493,7 @@ Provide:
 *Model: {analysis['model_used']} | Tokens: {analysis['tokens_used']['input']}->{analysis['tokens_used']['output']}*
 """
         url = f"https://api.github.com/repos/{owner}/{repo}/issues/{issue_number}/comments"
-        resp = requests.post(url, headers=self.github_headers, json={"body": comment_body})
+        resp = requests.post(url, headers=self.github_headers, json={"body": comment_body}, timeout=REQUEST_TIMEOUT)
         if resp.status_code == 201:
             print(f"Analysis posted to issue #{issue_number}")
             return True
@@ -440,22 +512,35 @@ Provide:
         system_prompt = f"""You are an autonomous code implementation agent. Your job is to resolve
 GitHub issue #{issue_number} by creating a pull request with the necessary changes.
 
-You have tools to interact with the repository. Follow this workflow:
+CRITICAL: You have a STRICT budget of {MAX_AGENT_TURNS} turns. You MUST create a PR within this budget.
+Do NOT spend all turns searching — prioritize action over exhaustive discovery.
 
-1. SEARCH: Use search_code to find ALL files affected by this issue.
-   Run multiple searches with different queries to be thorough.
-2. READ: Use read_file to read the current content of each affected file.
-3. BRANCH: Use create_branch to create a new branch (use 'bot/fix-issue-{issue_number}').
-4. WRITE: Use write_file to update each file that needs changes.
-   Provide the COMPLETE updated file content, not just the diff.
-   Only change what is necessary to resolve the issue.
-5. PR: Use create_pull_request to open a PR.
-   Include 'Closes #{issue_number}' in the body.
-6. COMMENT: Use post_comment to notify on the issue with a link to the PR.
+Available tools: search_code (max 3 uses), list_directory, list_files, read_file,
+create_branch, write_file, create_pull_request, post_comment
 
-Be thorough - search with multiple queries to find ALL affected files.
-For example, for copyright updates, search for 'Copyright', the old year, etc.
-Do NOT skip files. Read each one and update it if needed."""
+Follow this workflow IN ORDER:
+
+PHASE 1 — DISCOVER (turns 1-4 max):
+- Use list_directory to browse relevant directories (preferred over search_code)
+- Use search_code with 1-2 targeted queries for specific patterns (you only get 3 searches total)
+- Use read_file to read files you plan to change
+- Focus on files mentioned in the analysis below — do not search aimlessly
+
+PHASE 2 — IMPLEMENT (start by turn 5 at the latest):
+- Use create_branch to create branch 'bot/fix-issue-{issue_number}'
+- Use write_file for each file that needs changes (provide COMPLETE file content)
+- Only change what is necessary to resolve the issue
+
+PHASE 3 — FINALIZE:
+- Use create_pull_request to open a PR (include 'Closes #{issue_number}' in body)
+- Use post_comment to notify on the issue with a link to the PR
+
+RULES:
+- You MUST call create_branch by turn 5
+- You MUST call create_pull_request before running out of turns
+- Do NOT use read_file on directories — use list_directory instead
+- If search returns poor results, use list_directory to browse and find files manually
+- It is better to fix most files than to search forever trying to find every file"""
 
         user_msg = f"""Resolve this issue:
 
@@ -465,27 +550,42 @@ Body: {issue['body'] or '(no description)'}
 ANALYSIS:
 {analysis_result['analysis'][:3000]}
 
-Start by searching for all affected files, then implement the fix."""
+Start with 1-2 searches or list_directory calls, read the key files, then create a branch and implement the fix."""
 
         messages = [{"role": "user", "content": user_msg}]
-        max_turns = 30
         pr_url = None
+        branch_created = False
+        start_time = time.time()
+        time_limit = 8 * 60  # 8 minutes max for the agent loop
 
-        for turn in range(max_turns):
-            print(f"  Agent turn {turn + 1}...")
+        for turn in range(MAX_AGENT_TURNS):
+            elapsed = time.time() - start_time
+            if elapsed > time_limit:
+                print(f"  Time limit reached ({int(elapsed)}s). Stopping agent.")
+                tools.post_comment(
+                    f"Agent timed out after {int(elapsed)}s and {turn} turns. "
+                    "The issue may be too complex for automated resolution."
+                )
+                break
 
-            response = self.client.messages.create(
-                model="claude-sonnet-4-20250514",
-                max_tokens=16000,
-                system=system_prompt,
-                tools=IMPLEMENTATION_TOOLS,
-                messages=messages,
-            )
+            print(f"  Agent turn {turn + 1}/{MAX_AGENT_TURNS} ({int(elapsed)}s elapsed)...")
+
+            try:
+                response = self.client.messages.create(
+                    model="claude-sonnet-4-20250514",
+                    max_tokens=16000,
+                    system=system_prompt,
+                    tools=IMPLEMENTATION_TOOLS,
+                    messages=messages,
+                )
+            except Exception as e:
+                print(f"  Claude API error: {e}")
+                tools.post_comment(f"Agent encountered an API error: {e}")
+                break
 
             # Check if Claude is done (no more tool calls)
             if response.stop_reason == "end_turn":
                 print("  Agent finished.")
-                # Extract any final text
                 for block in response.content:
                     if block.type == "text":
                         print(f"  Final: {block.text[:200]}")
@@ -499,8 +599,14 @@ Start by searching for all affected files, then implement the fix."""
             tool_results = []
             for block in response.content:
                 if block.type == "tool_use":
-                    print(f"    Tool: {block.name}({json.dumps({k: v[:80] if isinstance(v, str) and len(v) > 80 else v for k, v in block.input.items()})})")
+                    # Log tool call (truncate long values for readability)
+                    short_input = {k: (v[:60] + "...") if isinstance(v, str) and len(v) > 60 else v
+                                   for k, v in block.input.items()}
+                    print(f"    Tool: {block.name}({json.dumps(short_input)})")
                     result = tools.execute(block.name, block.input)
+                    # Track branch creation
+                    if block.name == "create_branch" and "successfully" in result:
+                        branch_created = True
                     # Capture PR URL from create_pull_request
                     if block.name == "create_pull_request" and "PR created:" in result:
                         match = re.search(r'https://github\.com/\S+', result)
@@ -509,12 +615,34 @@ Start by searching for all affected files, then implement the fix."""
                     tool_results.append({
                         "type": "tool_result",
                         "tool_use_id": block.id,
-                        "content": result[:10000],  # limit result size
+                        "content": result[:8000],  # limit result size
                     })
                 elif block.type == "text" and block.text:
                     print(f"    Think: {block.text[:150]}")
 
             messages.append({"role": "assistant", "content": response.content})
+
+            # Phase enforcement: nudge Claude if it hasn't started implementing
+            nudge = None
+            if turn >= 4 and not branch_created:
+                remaining = MAX_AGENT_TURNS - turn - 1
+                nudge = (
+                    f"URGENT: You have used {turn + 1} turns without creating a branch. "
+                    f"Only {remaining} turns remain. You MUST call create_branch NOW, "
+                    "then write_file for each change, then create_pull_request. "
+                    "Stop searching and start implementing immediately."
+                )
+                print(f"    NUDGE: {nudge}")
+            elif turn >= 2 and not branch_created and tools.search_count >= 2:
+                nudge = (
+                    "You've done enough searching. Move to implementation: "
+                    "read the files you need, then create_branch and write_file."
+                )
+
+            if nudge:
+                tool_results.append({"type": "text", "text": nudge})
+
             messages.append({"role": "user", "content": tool_results})
 
+        print(f"  Agent completed in {int(time.time() - start_time)}s, {turn + 1} turns")
         return pr_url

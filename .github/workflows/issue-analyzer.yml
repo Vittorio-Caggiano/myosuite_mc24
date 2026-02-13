@@ -27,6 +27,7 @@ permissions:
 jobs:
   analyze-issue:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     # Triggers:
     #   - Manual dispatch
     #   - 'auto-fix' label  → analysis + PR
