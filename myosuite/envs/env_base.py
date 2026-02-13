@@ -157,7 +157,7 @@ class MujocoEnv(gym.Env, gym.utils.EzPickle, ObsVecDict):
             else self.mj_model.actuator_ctrlrange[:, 0].copy()
         )
         act_high = (
-            -np.ones(self.mj_model.nu)
+            np.ones(self.mj_model.nu)
             if self.normalize_act
             else self.mj_model.actuator_ctrlrange[:, 1].copy()
         )
@@ -201,9 +201,6 @@ class MujocoEnv(gym.Env, gym.utils.EzPickle, ObsVecDict):
         self.visual_keys = visual_keys
         self.obs_range = obs_range
 
-        # resolve action space
-        self.action_space = gym.spaces.Box(act_low, act_high, dtype=np.float32)
-
         # Number of environment step
         self.env_step = 0
 
@@ -213,12 +210,6 @@ class MujocoEnv(gym.Env, gym.utils.EzPickle, ObsVecDict):
 
         # Seeding
         self.seed(seed=None)
-
-        # Initializer
-        self.rwd_mode = reward_mode
-        self.obs_keys_wt = obs_keys
-        self.weighted_reward_keys = weighted_reward_keys
-        self.init_env_step = 0
 
         print("MyoSuite:> Environment initialized using envs_base.py")
 
