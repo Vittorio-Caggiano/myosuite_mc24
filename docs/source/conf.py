@@ -1,4 +1,4 @@
-# Copyright (c) MyoSuite Authors
+# Copyright (c) 2026 MyoSuite Authors
 # Authors  :: Vikash Kumar (vikashplus@gmail.com), Vittorio Caggiano (caggiano@gmail.com)
 #
 # This source code is licensed under the Apache 2 license found in the
@@ -13,7 +13,7 @@ sys.path.insert(0, os.path.abspath("../../myosuite"))
 # -- Project information
 
 project = "MyoSuite"
-copyright = "Copyright © MyoSuite Authors"
+copyright = "Copyright © 2026 MyoSuite Authors"
 author = "MyoSuite Authors"
 
 release = "0.2"
