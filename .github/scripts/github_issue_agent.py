@@ -1,182 +1,348 @@
 #!/usr/bin/env python3
 """
 GitHub Issue Analysis Agent
-Uses Claude API to analyze GitHub issues with repository context
-and provide actionable resolution plans.
+Uses Claude API with tool_use to analyze GitHub issues and autonomously
+create PRs with fixes. Claude drives the process using GitHub API tools.
 """
 
-import os
-import anthropic
-import requests
-from typing import Dict, List, Optional
+import base64
 import json
+import re
+import requests
+import anthropic
+from typing import Dict, List, Optional
+
+
+# --- Tool definitions for Claude ---
+IMPLEMENTATION_TOOLS = [
+    {
+        "name": "search_code",
+        "description": "Search for code patterns in the repository using GitHub Code Search. Use this to find ALL files that contain a specific pattern (e.g., copyright notices, specific function names, outdated imports).",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Search query (e.g., 'Copyright 2025', 'def old_function')"
+                }
+            },
+            "required": ["query"]
+        }
+    },
+    {
+        "name": "list_files",
+        "description": "List all files in the repository. Returns the full file tree.",
+        "input_schema": {
+            "type": "object",
+            "properties": {},
+        }
+    },
+    {
+        "name": "read_file",
+        "description": "Read the content of a specific file in the repository.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "File path relative to repo root (e.g., 'src/main.py')"
+                }
+            },
+            "required": ["path"]
+        }
+    },
+    {
+        "name": "create_branch",
+        "description": "Create a new git branch from main. Call this ONCE before writing any files.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "branch_name": {
+                    "type": "string",
+                    "description": "Branch name (e.g., 'bot/fix-issue-3')"
+                }
+            },
+            "required": ["branch_name"]
+        }
+    },
+    {
+        "name": "write_file",
+        "description": "Write or update a file on a branch. Provide the COMPLETE new file content. Each call creates a separate commit.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "File path relative to repo root"
+                },
+                "content": {
+                    "type": "string",
+                    "description": "Complete new file content"
+                },
+                "branch": {
+                    "type": "string",
+                    "description": "Branch to write to"
+                },
+                "message": {
+                    "type": "string",
+                    "description": "Commit message for this file change"
+                }
+            },
+            "required": ["path", "content", "branch", "message"]
+        }
+    },
+    {
+        "name": "create_pull_request",
+        "description": "Create a pull request from a branch to main. Call this AFTER all files have been written.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "title": {
+                    "type": "string",
+                    "description": "PR title (under 70 chars)"
+                },
+                "body": {
+                    "type": "string",
+                    "description": "PR description in markdown"
+                },
+                "branch": {
+                    "type": "string",
+                    "description": "Source branch name"
+                }
+            },
+            "required": ["title", "body", "branch"]
+        }
+    },
+    {
+        "name": "post_comment",
+        "description": "Post a comment on the GitHub issue.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "body": {
+                    "type": "string",
+                    "description": "Comment body in markdown"
+                }
+            },
+            "required": ["body"]
+        }
+    },
+]
+
+
+class GitHubTools:
+    """Executes GitHub API operations on behalf of Claude's tool calls."""
+
+    def __init__(self, github_token: str, owner: str, repo: str, issue_number: int):
+        self.owner = owner
+        self.repo = repo
+        self.issue_number = issue_number
+        self.headers = {
+            "Authorization": f"token {github_token}",
+            "Accept": "application/vnd.github.v3+json",
+        }
+        self.base_url = f"https://api.github.com/repos/{owner}/{repo}"
+
+    def search_code(self, query: str) -> str:
+        search_headers = {**self.headers, "Accept": "application/vnd.github.text-match+json"}
+        params = {"q": f"{query} repo:{self.owner}/{self.repo}", "per_page": 100}
+        resp = requests.get("https://api.github.com/search/code", headers=search_headers, params=params)
+        if resp.status_code != 200:
+            return f"Search failed: {resp.status_code}"
+        items = resp.json().get("items", [])
+        results = []
+        for item in items:
+            fragments = [tm.get("fragment", "") for tm in item.get("text_matches", [])]
+            results.append({"path": item["path"], "matches": fragments})
+        return json.dumps(results, indent=2)
+
+    def list_files(self) -> str:
+        resp = requests.get(f"{self.base_url}/git/trees/main?recursive=1", headers=self.headers)
+        if resp.status_code != 200:
+            return f"Failed to list files: {resp.status_code}"
+        paths = [item["path"] for item in resp.json().get("tree", []) if item["type"] == "blob"]
+        return json.dumps(paths)
+
+    def read_file(self, path: str) -> str:
+        resp = requests.get(f"{self.base_url}/contents/{path}", headers=self.headers, params={"ref": "main"})
+        if resp.status_code != 200:
+            return f"File not found: {path} ({resp.status_code})"
+        content = base64.b64decode(resp.json()["content"]).decode("utf-8")
+        return content
+
+    def create_branch(self, branch_name: str) -> str:
+        # Get main HEAD
+        ref_resp = requests.get(f"{self.base_url}/git/ref/heads/main", headers=self.headers)
+        if ref_resp.status_code != 200:
+            return f"Failed to get main ref: {ref_resp.status_code}"
+        sha = ref_resp.json()["object"]["sha"]
+        # Create branch
+        resp = requests.post(
+            f"{self.base_url}/git/refs",
+            headers=self.headers,
+            json={"ref": f"refs/heads/{branch_name}", "sha": sha},
+        )
+        if resp.status_code == 201:
+            return f"Branch '{branch_name}' created successfully"
+        elif resp.status_code == 422:
+            return f"Branch '{branch_name}' already exists"
+        return f"Failed to create branch: {resp.status_code} {resp.text}"
+
+    def write_file(self, path: str, content: str, branch: str, message: str) -> str:
+        # Check if file exists to get its SHA (needed for updates)
+        existing = requests.get(
+            f"{self.base_url}/contents/{path}",
+            headers=self.headers,
+            params={"ref": branch},
+        )
+        payload = {
+            "message": message,
+            "content": base64.b64encode(content.encode("utf-8")).decode("ascii"),
+            "branch": branch,
+        }
+        if existing.status_code == 200:
+            payload["sha"] = existing.json()["sha"]
+
+        resp = requests.put(f"{self.base_url}/contents/{path}", headers=self.headers, json=payload)
+        if resp.status_code in (200, 201):
+            return f"File '{path}' written successfully"
+        return f"Failed to write '{path}': {resp.status_code} {resp.text}"
+
+    def create_pull_request(self, title: str, body: str, branch: str) -> str:
+        resp = requests.post(
+            f"{self.base_url}/pulls",
+            headers=self.headers,
+            json={"title": title, "body": body, "head": branch, "base": "main"},
+        )
+        if resp.status_code == 201:
+            url = resp.json()["html_url"]
+            return f"PR created: {url}"
+        return f"Failed to create PR: {resp.status_code} {resp.text}"
+
+    def post_comment(self, body: str) -> str:
+        resp = requests.post(
+            f"{self.base_url}/issues/{self.issue_number}/comments",
+            headers=self.headers,
+            json={"body": body},
+        )
+        if resp.status_code == 201:
+            return "Comment posted"
+        return f"Failed to post comment: {resp.status_code}"
+
+    def execute(self, tool_name: str, tool_input: dict) -> str:
+        """Dispatch a tool call to the appropriate method."""
+        dispatch = {
+            "search_code": lambda: self.search_code(tool_input["query"]),
+            "list_files": lambda: self.list_files(),
+            "read_file": lambda: self.read_file(tool_input["path"]),
+            "create_branch": lambda: self.create_branch(tool_input["branch_name"]),
+            "write_file": lambda: self.write_file(
+                tool_input["path"], tool_input["content"],
+                tool_input["branch"], tool_input["message"]
+            ),
+            "create_pull_request": lambda: self.create_pull_request(
+                tool_input["title"], tool_input["body"], tool_input["branch"]
+            ),
+            "post_comment": lambda: self.post_comment(tool_input["body"]),
+        }
+        fn = dispatch.get(tool_name)
+        if fn:
+            try:
+                return fn()
+            except Exception as e:
+                return f"Error executing {tool_name}: {e}"
+        return f"Unknown tool: {tool_name}"
+
 
 class GitHubIssueAgent:
     def __init__(self, github_token: str, anthropic_api_key: str):
-        """
-        Initialize the GitHub Issue Agent
-        
-        Args:
-            github_token: GitHub personal access token
-            anthropic_api_key: Anthropic API key for Claude
-        """
         self.github_token = github_token
         self.client = anthropic.Anthropic(api_key=anthropic_api_key)
         self.github_headers = {
             "Authorization": f"token {github_token}",
-            "Accept": "application/vnd.github.v3+json"
+            "Accept": "application/vnd.github.v3+json",
         }
-    
+
     def get_repository_context(self, owner: str, repo: str) -> Dict:
-        """
-        Gather repository context including README, structure, and recent commits
-        """
+        """Gather repository context including README, structure, and recent commits."""
         base_url = f"https://api.github.com/repos/{owner}/{repo}"
-        
-        context = {
-            "repo_info": {},
-            "readme": "",
-            "structure": [],
-            "recent_commits": []
-        }
-        
-        # Get repository info
-        response = requests.get(base_url, headers=self.github_headers)
-        if response.status_code == 200:
-            repo_data = response.json()
+        context = {"repo_info": {}, "readme": "", "structure": [], "recent_commits": []}
+
+        resp = requests.get(base_url, headers=self.github_headers)
+        if resp.status_code == 200:
+            d = resp.json()
             context["repo_info"] = {
-                "name": repo_data.get("name"),
-                "description": repo_data.get("description"),
-                "language": repo_data.get("language"),
-                "topics": repo_data.get("topics", [])
+                "name": d.get("name"), "description": d.get("description"),
+                "language": d.get("language"), "topics": d.get("topics", []),
             }
-        
-        # Get README
+
         try:
-            readme_response = requests.get(
-                f"{base_url}/readme",
-                headers=self.github_headers
-            )
-            if readme_response.status_code == 200:
-                readme_data = readme_response.json()
-                # Decode base64 content
-                import base64
-                context["readme"] = base64.b64decode(
-                    readme_data["content"]
-                ).decode('utf-8')
-        except Exception as e:
-            print(f"Could not fetch README: {e}")
-        
-        # Get repository tree (file structure)
+            r = requests.get(f"{base_url}/readme", headers=self.github_headers)
+            if r.status_code == 200:
+                context["readme"] = base64.b64decode(r.json()["content"]).decode("utf-8")
+        except Exception:
+            pass
+
         try:
-            tree_response = requests.get(
-                f"{base_url}/git/trees/main?recursive=1",
-                headers=self.github_headers
-            )
-            if tree_response.status_code == 200:
-                tree_data = tree_response.json()
-                context["structure"] = [
-                    item["path"] for item in tree_data.get("tree", [])[:100]
-                ]
-        except Exception as e:
-            print(f"Could not fetch repository structure: {e}")
-        
-        # Get recent commits
+            r = requests.get(f"{base_url}/git/trees/main?recursive=1", headers=self.github_headers)
+            if r.status_code == 200:
+                context["structure"] = [i["path"] for i in r.json().get("tree", [])[:100]]
+        except Exception:
+            pass
+
         try:
-            commits_response = requests.get(
-                f"{base_url}/commits?per_page=10",
-                headers=self.github_headers
-            )
-            if commits_response.status_code == 200:
-                commits_data = commits_response.json()
+            r = requests.get(f"{base_url}/commits?per_page=10", headers=self.github_headers)
+            if r.status_code == 200:
                 context["recent_commits"] = [
-                    {
-                        "sha": commit["sha"][:7],
-                        "message": commit["commit"]["message"],
-                        "author": commit["commit"]["author"]["name"]
-                    }
-                    for commit in commits_data
+                    {"sha": c["sha"][:7], "message": c["commit"]["message"],
+                     "author": c["commit"]["author"]["name"]}
+                    for c in r.json()
                 ]
-        except Exception as e:
-            print(f"Could not fetch recent commits: {e}")
-        
+        except Exception:
+            pass
+
         return context
-    
+
     def get_issue_details(self, owner: str, repo: str, issue_number: int) -> Dict:
-        """
-        Fetch detailed information about a specific issue
-        """
+        """Fetch detailed information about a specific issue."""
         url = f"https://api.github.com/repos/{owner}/{repo}/issues/{issue_number}"
-        response = requests.get(url, headers=self.github_headers)
-        
-        if response.status_code == 200:
-            issue_data = response.json()
-            
-            # Get comments
-            comments = []
-            if issue_data.get("comments", 0) > 0:
-                comments_url = issue_data["comments_url"]
-                comments_response = requests.get(
-                    comments_url,
-                    headers=self.github_headers
-                )
-                if comments_response.status_code == 200:
-                    comments_data = comments_response.json()
-                    comments = [
-                        {
-                            "author": comment["user"]["login"],
-                            "body": comment["body"],
-                            "created_at": comment["created_at"]
-                        }
-                        for comment in comments_data
-                    ]
-            
-            return {
-                "number": issue_data["number"],
-                "title": issue_data["title"],
-                "body": issue_data["body"],
-                "state": issue_data["state"],
-                "labels": [label["name"] for label in issue_data.get("labels", [])],
-                "assignees": [assignee["login"] for assignee in issue_data.get("assignees", [])],
-                "created_at": issue_data["created_at"],
-                "updated_at": issue_data["updated_at"],
-                "comments": comments
-            }
-        else:
-            raise Exception(f"Failed to fetch issue: {response.status_code}")
-    
-    def analyze_issue(
-        self,
-        owner: str,
-        repo: str,
-        issue_number: int,
-        extended_thinking: bool = True
-    ) -> Dict:
-        """
-        Analyze an issue using Claude and provide a resolution plan
-        
-        Args:
-            owner: Repository owner
-            repo: Repository name
-            issue_number: Issue number to analyze
-            extended_thinking: Use Claude's extended thinking capability
-        
-        Returns:
-            Dictionary containing analysis and action plan
-        """
+        resp = requests.get(url, headers=self.github_headers)
+        if resp.status_code != 200:
+            raise Exception(f"Failed to fetch issue: {resp.status_code}")
+
+        d = resp.json()
+        comments = []
+        if d.get("comments", 0) > 0:
+            cr = requests.get(d["comments_url"], headers=self.github_headers)
+            if cr.status_code == 200:
+                comments = [
+                    {"author": c["user"]["login"], "body": c["body"], "created_at": c["created_at"]}
+                    for c in cr.json()
+                ]
+
+        return {
+            "number": d["number"], "title": d["title"], "body": d["body"],
+            "state": d["state"],
+            "labels": [l["name"] for l in d.get("labels", [])],
+            "assignees": [a["login"] for a in d.get("assignees", [])],
+            "created_at": d["created_at"], "updated_at": d["updated_at"],
+            "comments": comments,
+        }
+
+    def analyze_issue(self, owner: str, repo: str, issue_number: int,
+                      extended_thinking: bool = True) -> Dict:
+        """Analyze an issue using Claude and provide a resolution plan."""
         print(f"Fetching repository context for {owner}/{repo}...")
         repo_context = self.get_repository_context(owner, repo)
-        
+
         print(f"Fetching issue #{issue_number} details...")
         issue = self.get_issue_details(owner, repo, issue_number)
-        
+
         print("Analyzing issue with Claude...")
-        
-        # Construct the prompt for Claude
-        prompt = f"""You are a GitHub issue analysis agent. Your task is to analyze the following issue in the context of the repository and provide a structured action plan.
+
+        prompt = f"""You are a GitHub issue analysis agent. Analyze the following issue and provide a structured action plan.
 
 REPOSITORY CONTEXT:
--------------------
 Repository: {owner}/{repo}
 Description: {repo_context['repo_info'].get('description', 'N/A')}
 Primary Language: {repo_context['repo_info'].get('language', 'N/A')}
@@ -192,7 +358,6 @@ Recent Commits:
 {chr(10).join([f"- {c['sha']}: {c['message'][:100]}" for c in repo_context['recent_commits']])}
 
 ISSUE DETAILS:
---------------
 Issue #{issue['number']}: {issue['title']}
 State: {issue['state']}
 Labels: {', '.join(issue['labels']) if issue['labels'] else 'None'}
@@ -204,504 +369,152 @@ Description:
 Comments ({len(issue['comments'])}):
 {chr(10).join([f"- {c['author']}: {c['body'][:200]}" for c in issue['comments'][:5]])}
 
-ANALYSIS TASK:
---------------
-Please analyze this issue and provide:
+Provide:
+1. **Issue Classification**: bug, feature request, documentation, etc.
+2. **Severity Assessment**: critical/high/medium/low and why
+3. **Root Cause Analysis**: potential root causes based on repo context
+4. **Action Required**: yes/no and explanation
+5. **Resolution Plan**: step-by-step with specific files, code changes, testing
+6. **Estimated Effort**: hours/days
+7. **Related Issues**: common patterns in similar projects"""
 
-1. **Issue Classification**: Categorize the issue (bug, feature request, documentation, question, etc.)
-
-2. **Severity Assessment**: Rate the severity (critical, high, medium, low) and explain why
-
-3. **Root Cause Analysis**: Based on the repository context, identify potential root causes
-
-4. **Action Required**: Determine if this issue requires action (yes/no) and explain
-
-5. **Resolution Plan**: Provide a detailed, step-by-step plan to resolve this issue, including:
-   - Specific files that likely need to be modified
-   - Code changes or implementation approach
-   - Testing recommendations
-   - Documentation updates needed
-
-6. **Estimated Effort**: Estimate the effort required (hours/days)
-
-7. **Related Issues**: Identify if this might be related to other common issues in similar projects
-
-Please structure your response in a clear, actionable format."""
-
-        # Call Claude API
         kwargs = {
             "model": "claude-sonnet-4-20250514",
             "max_tokens": 4096,
-            "messages": [
-                {
-                    "role": "user",
-                    "content": prompt
-                }
-            ],
+            "messages": [{"role": "user", "content": prompt}],
         }
         if extended_thinking:
-            kwargs["thinking"] = {
-                "type": "enabled",
-                "budget_tokens": 3000
-            }
+            kwargs["thinking"] = {"type": "enabled", "budget_tokens": 3000}
+
         response = self.client.messages.create(**kwargs)
-        
-        # Extract the analysis from response
+
         analysis_text = ""
         thinking_text = ""
-        
         for block in response.content:
             if block.type == "thinking":
                 thinking_text = block.thinking
             elif block.type == "text":
                 analysis_text = block.text
-        
-        result = {
+
+        return {
             "issue_number": issue_number,
-            "issue_title": issue['title'],
+            "issue_title": issue["title"],
             "repository": f"{owner}/{repo}",
             "analysis": analysis_text,
             "thinking_process": thinking_text if extended_thinking else None,
             "model_used": response.model,
             "tokens_used": {
                 "input": response.usage.input_tokens,
-                "output": response.usage.output_tokens
-            }
+                "output": response.usage.output_tokens,
+            },
         }
-        
-        return result
-    
-    def post_analysis_comment(
-        self,
-        owner: str,
-        repo: str,
-        issue_number: int,
-        analysis: Dict
-    ):
-        """
-        Post the analysis as a comment on the GitHub issue
-        """
-        comment_body = f"""## 🤖 AI Analysis Report
+
+    def post_analysis_comment(self, owner: str, repo: str, issue_number: int,
+                              analysis: Dict):
+        """Post the analysis as a comment on the GitHub issue."""
+        comment_body = f"""## AI Analysis Report
 
 {analysis['analysis']}
 
 ---
 *Generated by Claude Issue Agent*
-*Model: {analysis['model_used']} | Tokens: {analysis['tokens_used']['input']}→{analysis['tokens_used']['output']}*
+*Model: {analysis['model_used']} | Tokens: {analysis['tokens_used']['input']}->{analysis['tokens_used']['output']}*
 """
-        
         url = f"https://api.github.com/repos/{owner}/{repo}/issues/{issue_number}/comments"
-        response = requests.post(
-            url,
-            headers=self.github_headers,
-            json={"body": comment_body}
-        )
-        
-        if response.status_code == 201:
-            print(f"✓ Analysis posted to issue #{issue_number}")
+        resp = requests.post(url, headers=self.github_headers, json={"body": comment_body})
+        if resp.status_code == 201:
+            print(f"Analysis posted to issue #{issue_number}")
             return True
-        else:
-            print(f"✗ Failed to post comment: {response.status_code}")
-            return False
+        print(f"Failed to post comment: {resp.status_code}")
+        return False
 
-
-    def get_file_content(self, owner: str, repo: str, path: str, ref: str = "main") -> Optional[str]:
-        """Fetch a file's content from the repository."""
-        url = f"https://api.github.com/repos/{owner}/{repo}/contents/{path}"
-        response = requests.get(url, headers=self.github_headers, params={"ref": ref})
-        if response.status_code == 200:
-            import base64
-            return base64.b64decode(response.json()["content"]).decode("utf-8")
-        return None
-
-    def search_code(self, owner: str, repo: str, query: str, per_page: int = 100) -> List[Dict]:
+    def implement_issue(self, owner: str, repo: str, issue_number: int,
+                        analysis_result: Dict) -> Optional[str]:
         """
-        Search for code patterns in the repository using GitHub Code Search API.
-        Returns list of {path, matches} for files containing the query.
+        Agentic implementation: Claude autonomously uses tools to search code,
+        read files, create a branch, write fixes, and open a PR.
         """
-        search_headers = {**self.github_headers, "Accept": "application/vnd.github.text-match+json"}
-        url = "https://api.github.com/search/code"
-        params = {"q": f"{query} repo:{owner}/{repo}", "per_page": per_page}
-        response = requests.get(url, headers=search_headers, params=params)
-        if response.status_code == 200:
-            data = response.json()
-            results = []
-            for item in data.get("items", []):
-                match_info = {
-                    "path": item["path"],
-                    "matches": []
-                }
-                for tm in item.get("text_matches", []):
-                    match_info["matches"].append(tm.get("fragment", ""))
-                results.append(match_info)
-            print(f"  Code search for '{query}': found {len(results)} files")
-            return results
-        else:
-            print(f"  Code search failed: {response.status_code}")
-            return []
-
-    def get_full_tree(self, owner: str, repo: str, ref: str = "main") -> List[str]:
-        """Get the full file tree of the repository (all file paths)."""
-        url = f"https://api.github.com/repos/{owner}/{repo}/git/trees/{ref}?recursive=1"
-        response = requests.get(url, headers=self.github_headers)
-        if response.status_code == 200:
-            return [item["path"] for item in response.json().get("tree", [])
-                    if item["type"] == "blob"]
-        return []
-
-    def generate_implementation(
-        self,
-        owner: str,
-        repo: str,
-        issue: Dict,
-        analysis: str,
-        repo_context: Dict,
-    ) -> Optional[Dict]:
-        """
-        Ask Claude to generate concrete file changes to resolve the issue.
-        Uses a 3-step approach:
-          1. Ask Claude what search queries to run to find affected files
-          2. Run those searches, collect matching files
-          3. Ask Claude to generate the actual changes
-
-        Returns a dict with keys: changes, files, pr_title, pr_body.
-        """
-        import re
-
-        all_files = self.get_full_tree(owner, repo)
-        print(f"Repository has {len(all_files)} files total")
-
-        # Step 1: Ask Claude what to search for
-        search_prompt = f"""You are a code implementation agent. For the issue below, I need to find
-ALL files in the repository that need to be modified.
-
-REPOSITORY: {owner}/{repo}
-ISSUE #{issue['number']}: {issue['title']}
-ISSUE BODY: {issue['body'] or '(no description)'}
-
-ANALYSIS SUMMARY:
-{analysis[:2000]}
-
-ALL REPOSITORY FILES ({len(all_files)} files):
-{chr(10).join(all_files)}
-
-Tell me:
-1. What code search queries should I run to find ALL affected files?
-   (e.g., for copyright updates, search for "Copyright" and year patterns)
-2. Are there specific file paths from the list above that should be included?
-
-Respond with ONLY a JSON object (no markdown fences):
-{{
-  "search_queries": ["query1", "query2"],
-  "explicit_paths": ["path/to/file1", "path/to/file2"],
-  "pr_title": "Short PR title (under 70 chars)",
-  "pr_body": "Description of what changes will be made and why"
-}}"""
-
-        response = self.client.messages.create(
-            model="claude-sonnet-4-20250514",
-            max_tokens=4096,
-            messages=[{"role": "user", "content": search_prompt}],
-        )
-
-        plan_text = ""
-        for block in response.content:
-            if block.type == "text":
-                plan_text = block.text
-                break
-
-        try:
-            plan = json.loads(plan_text)
-        except json.JSONDecodeError:
-            match = re.search(r'\{[\s\S]*\}', plan_text)
-            if match:
-                plan = json.loads(match.group())
-            else:
-                print("Failed to parse search plan from Claude response")
-                return None
-
-        # Step 2: Run the searches and collect all affected file paths
-        affected_paths = set(plan.get("explicit_paths", []))
-
-        for query in plan.get("search_queries", []):
-            results = self.search_code(owner, repo, query)
-            for r in results:
-                affected_paths.add(r["path"])
-
-        # Filter to paths that actually exist in the tree
-        valid_paths = [p for p in affected_paths if p in all_files]
-        print(f"Found {len(valid_paths)} files to potentially modify")
-
-        if not valid_paths:
-            print("No files found to modify.")
-            return None
-
-        # Step 3: Fetch all affected files and ask Claude to generate changes
-        # Process in batches to stay within API limits
-        MAX_FILES_PER_BATCH = 15
-        all_changes = []
-        all_impl_files = []
-
-        for batch_start in range(0, len(valid_paths), MAX_FILES_PER_BATCH):
-            batch_paths = valid_paths[batch_start:batch_start + MAX_FILES_PER_BATCH]
-            batch_num = batch_start // MAX_FILES_PER_BATCH + 1
-            total_batches = (len(valid_paths) + MAX_FILES_PER_BATCH - 1) // MAX_FILES_PER_BATCH
-            print(f"Processing batch {batch_num}/{total_batches} ({len(batch_paths)} files)...")
-
-            files_context = ""
-            for path in batch_paths:
-                content = self.get_file_content(owner, repo, path)
-                if content is not None:
-                    files_context += f"\n--- FILE: {path} ---\n{content}\n--- END FILE ---\n"
-
-            implementation_prompt = f"""You are a code implementation agent. Apply the MINIMAL changes needed
-to resolve the issue for EACH file below.
-
-ISSUE #{issue['number']}: {issue['title']}
-ISSUE BODY: {issue['body'] or '(no description)'}
-
-TASK: {plan['pr_body']}
-
-CURRENT FILE CONTENTS:
-{files_context}
-
-For each file, decide if it actually needs changes. If a file does NOT need
-changes (e.g., the search matched but the content is already correct), skip it.
-
-Respond with ONLY a JSON object (no markdown fences):
-{{
-  "files": [
-    {{
-      "path": "relative/file/path",
-      "content": "COMPLETE updated file content",
-      "description": "What was changed"
-    }}
-  ]
-}}
-
-IMPORTANT:
-- Only include files that ACTUALLY need changes.
-- Provide the COMPLETE file content for each changed file.
-- Make ONLY the changes needed to resolve the issue — nothing else."""
-
-            impl_response = self.client.messages.create(
-                model="claude-sonnet-4-20250514",
-                max_tokens=16000,
-                messages=[{"role": "user", "content": implementation_prompt}],
-            )
-
-            impl_text = ""
-            for block in impl_response.content:
-                if block.type == "text":
-                    impl_text = block.text
-                    break
-
-            try:
-                impl = json.loads(impl_text)
-            except json.JSONDecodeError:
-                match = re.search(r'\{[\s\S]*\}', impl_text)
-                if match:
-                    impl = json.loads(match.group())
-                else:
-                    print(f"  Failed to parse batch {batch_num} response, skipping")
-                    continue
-
-            for f in impl.get("files", []):
-                all_impl_files.append({"path": f["path"], "content": f["content"]})
-                all_changes.append({"path": f["path"], "description": f.get("description", "Updated")})
-
-        if not all_impl_files:
-            print("No file changes were generated.")
-            return None
-
-        print(f"Total files to change: {len(all_impl_files)}")
-
-        return {
-            "pr_title": plan["pr_title"],
-            "pr_body": plan["pr_body"],
-            "changes": all_changes,
-            "files": all_impl_files,
-        }
-
-    def create_branch(self, owner: str, repo: str, branch_name: str, base_ref: str = "main") -> bool:
-        """Create a new branch from base_ref."""
-        # Get the SHA of the base branch
-        url = f"https://api.github.com/repos/{owner}/{repo}/git/ref/heads/{base_ref}"
-        response = requests.get(url, headers=self.github_headers)
-        if response.status_code != 200:
-            print(f"Failed to get base ref: {response.status_code}")
-            return False
-
-        base_sha = response.json()["object"]["sha"]
-
-        # Create the new branch
-        url = f"https://api.github.com/repos/{owner}/{repo}/git/refs"
-        response = requests.post(
-            url,
-            headers=self.github_headers,
-            json={"ref": f"refs/heads/{branch_name}", "sha": base_sha},
-        )
-        if response.status_code == 201:
-            print(f"Created branch: {branch_name}")
-            return True
-        else:
-            print(f"Failed to create branch: {response.status_code} {response.text}")
-            return False
-
-    def commit_files(
-        self, owner: str, repo: str, branch: str, files: List[Dict], message: str
-    ) -> bool:
-        """
-        Commit multiple file changes to a branch in a single commit
-        using the Git Data API (trees + commits).
-        """
-        base_url = f"https://api.github.com/repos/{owner}/{repo}"
-
-        # 1. Get the latest commit SHA on the branch
-        ref_resp = requests.get(
-            f"{base_url}/git/ref/heads/{branch}", headers=self.github_headers
-        )
-        if ref_resp.status_code != 200:
-            print(f"Failed to get branch ref: {ref_resp.status_code}")
-            return False
-        latest_sha = ref_resp.json()["object"]["sha"]
-
-        # 2. Get the tree SHA of that commit
-        commit_resp = requests.get(
-            f"{base_url}/git/commits/{latest_sha}", headers=self.github_headers
-        )
-        base_tree_sha = commit_resp.json()["tree"]["sha"]
-
-        # 3. Create blobs for each file and build tree entries
-        tree_items = []
-        for f in files:
-            blob_resp = requests.post(
-                f"{base_url}/git/blobs",
-                headers=self.github_headers,
-                json={"content": f["content"], "encoding": "utf-8"},
-            )
-            if blob_resp.status_code != 201:
-                print(f"Failed to create blob for {f['path']}: {blob_resp.status_code}")
-                return False
-            tree_items.append(
-                {
-                    "path": f["path"],
-                    "mode": "100644",
-                    "type": "blob",
-                    "sha": blob_resp.json()["sha"],
-                }
-            )
-
-        # 4. Create a new tree
-        tree_resp = requests.post(
-            f"{base_url}/git/trees",
-            headers=self.github_headers,
-            json={"base_tree": base_tree_sha, "tree": tree_items},
-        )
-        if tree_resp.status_code != 201:
-            print(f"Failed to create tree: {tree_resp.status_code}")
-            return False
-        new_tree_sha = tree_resp.json()["sha"]
-
-        # 5. Create a new commit
-        commit_resp = requests.post(
-            f"{base_url}/git/commits",
-            headers=self.github_headers,
-            json={
-                "message": message,
-                "tree": new_tree_sha,
-                "parents": [latest_sha],
-            },
-        )
-        if commit_resp.status_code != 201:
-            print(f"Failed to create commit: {commit_resp.status_code}")
-            return False
-        new_commit_sha = commit_resp.json()["sha"]
-
-        # 6. Update the branch reference
-        ref_update = requests.patch(
-            f"{base_url}/git/refs/heads/{branch}",
-            headers=self.github_headers,
-            json={"sha": new_commit_sha},
-        )
-        if ref_update.status_code == 200:
-            print(f"Committed {len(files)} file(s) to {branch}")
-            return True
-        else:
-            print(f"Failed to update ref: {ref_update.status_code}")
-            return False
-
-    def create_pull_request(
-        self, owner: str, repo: str, title: str, body: str, head: str, base: str = "main"
-    ) -> Optional[str]:
-        """Create a pull request. Returns the PR URL or None."""
-        url = f"https://api.github.com/repos/{owner}/{repo}/pulls"
-        response = requests.post(
-            url,
-            headers=self.github_headers,
-            json={"title": title, "body": body, "head": head, "base": base},
-        )
-        if response.status_code == 201:
-            pr_url = response.json()["html_url"]
-            print(f"Created PR: {pr_url}")
-            return pr_url
-        else:
-            print(f"Failed to create PR: {response.status_code} {response.text}")
-            return None
-
-    def implement_issue(
-        self, owner: str, repo: str, issue_number: int, analysis_result: Dict
-    ) -> Optional[str]:
-        """
-        Full implementation flow: generate changes → create branch → commit → open PR.
-        Returns the PR URL or None.
-        """
-        print(f"\nGenerating implementation for issue #{issue_number}...")
-
-        repo_context = self.get_repository_context(owner, repo)
+        tools = GitHubTools(self.github_token, owner, repo, issue_number)
         issue = self.get_issue_details(owner, repo, issue_number)
 
-        impl = self.generate_implementation(
-            owner, repo, issue, analysis_result["analysis"], repo_context
-        )
-        if not impl or not impl.get("files"):
-            print("No implementation changes generated.")
-            return None
+        system_prompt = f"""You are an autonomous code implementation agent. Your job is to resolve
+GitHub issue #{issue_number} by creating a pull request with the necessary changes.
 
-        branch_name = f"bot/fix-issue-{issue_number}"
+You have tools to interact with the repository. Follow this workflow:
 
-        print(f"Creating branch {branch_name}...")
-        if not self.create_branch(owner, repo, branch_name):
-            return None
+1. SEARCH: Use search_code to find ALL files affected by this issue.
+   Run multiple searches with different queries to be thorough.
+2. READ: Use read_file to read the current content of each affected file.
+3. BRANCH: Use create_branch to create a new branch (use 'bot/fix-issue-{issue_number}').
+4. WRITE: Use write_file to update each file that needs changes.
+   Provide the COMPLETE updated file content, not just the diff.
+   Only change what is necessary to resolve the issue.
+5. PR: Use create_pull_request to open a PR.
+   Include 'Closes #{issue_number}' in the body.
+6. COMMENT: Use post_comment to notify on the issue with a link to the PR.
 
-        commit_msg = f"fix: {impl['pr_title']} (#{issue_number})"
-        print(f"Committing {len(impl['files'])} file(s)...")
-        if not self.commit_files(owner, repo, branch_name, impl["files"], commit_msg):
-            return None
+Be thorough - search with multiple queries to find ALL affected files.
+For example, for copyright updates, search for 'Copyright', the old year, etc.
+Do NOT skip files. Read each one and update it if needed."""
 
-        pr_body = f"""## Summary
-{impl['pr_body']}
+        user_msg = f"""Resolve this issue:
 
-### Changes
-{chr(10).join(f"- **{c['path']}**: {c['description']}" for c in impl['changes'])}
+ISSUE #{issue['number']}: {issue['title']}
+Body: {issue['body'] or '(no description)'}
 
-Closes #{issue_number}
+ANALYSIS:
+{analysis_result['analysis'][:3000]}
 
----
-*Generated automatically by Claude Issue Agent*"""
+Start by searching for all affected files, then implement the fix."""
 
-        print("Opening pull request...")
-        pr_url = self.create_pull_request(
-            owner, repo, impl["pr_title"], pr_body, branch_name
-        )
+        messages = [{"role": "user", "content": user_msg}]
+        max_turns = 30
+        pr_url = None
 
-        if pr_url:
-            # Post a comment on the issue linking to the PR
-            comment = f"I've created a pull request with a proposed fix: {pr_url}"
-            requests.post(
-                f"https://api.github.com/repos/{owner}/{repo}/issues/{issue_number}/comments",
-                headers=self.github_headers,
-                json={"body": comment},
+        for turn in range(max_turns):
+            print(f"  Agent turn {turn + 1}...")
+
+            response = self.client.messages.create(
+                model="claude-sonnet-4-20250514",
+                max_tokens=16000,
+                system=system_prompt,
+                tools=IMPLEMENTATION_TOOLS,
+                messages=messages,
             )
+
+            # Check if Claude is done (no more tool calls)
+            if response.stop_reason == "end_turn":
+                print("  Agent finished.")
+                # Extract any final text
+                for block in response.content:
+                    if block.type == "text":
+                        print(f"  Final: {block.text[:200]}")
+                        if "PR created:" in block.text:
+                            match = re.search(r'https://github\.com/\S+', block.text)
+                            if match:
+                                pr_url = match.group()
+                break
+
+            # Process tool calls
+            tool_results = []
+            for block in response.content:
+                if block.type == "tool_use":
+                    print(f"    Tool: {block.name}({json.dumps({k: v[:80] if isinstance(v, str) and len(v) > 80 else v for k, v in block.input.items()})})")
+                    result = tools.execute(block.name, block.input)
+                    # Capture PR URL from create_pull_request
+                    if block.name == "create_pull_request" and "PR created:" in result:
+                        match = re.search(r'https://github\.com/\S+', result)
+                        if match:
+                            pr_url = match.group()
+                    tool_results.append({
+                        "type": "tool_result",
+                        "tool_use_id": block.id,
+                        "content": result[:10000],  # limit result size
+                    })
+                elif block.type == "text" and block.text:
+                    print(f"    Think: {block.text[:150]}")
+
+            messages.append({"role": "assistant", "content": response.content})
+            messages.append({"role": "user", "content": tool_results})
 
         return pr_url
